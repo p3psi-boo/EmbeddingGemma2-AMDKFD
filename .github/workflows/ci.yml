@@ -16,19 +16,29 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - uses: cachix/install-nix-action@3c6342b75005b9cc7c7d4069c3e9179247c89012 # v31
+      - name: Fetch checksum-locked Nix installer
+        run: scripts/fetch-nix-installer.sh "$RUNNER_TEMP/nix-install"
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2, peeled commit
+        with:
+          install_url: file://${{ runner.temp }}/nix-install
+          enable_kvm: false
+      - name: Verify bootstrap Nix version
+        run: test "$(nix --version)" = 'nix (Nix) 2.35.3'
       - name: Public source hygiene
-        run: python3 scripts/public_repo.py check
+        run: nix develop --no-update-lock-file -c python3 scripts/public_repo.py check
       - name: Publication regression tests
-        run: python3 -m unittest discover -s tests -p 'test_*.py'
+        run: nix develop --no-update-lock-file -c python3 -m unittest discover -s tests -p 'test_*.py'
       - name: Secret scan
-        run: nix develop -c gitleaks dir --redact --no-banner .
+        run: nix develop --no-update-lock-file -c gitleaks dir --redact --no-banner .
       - name: Shell and Python syntax
         run: |
-          for script in scripts/*.sh; do bash -n "$script"; done
-          python3 -m compileall -q scripts tests
+          nix develop --no-update-lock-file -c bash -c '
+            set -e
+            for script in scripts/*.sh; do bash -n "$script"; done
+            python3 -m compileall -q scripts tests
+          '
       - name: Build package and run CPU tests
-        run: nix build --print-build-logs
+        run: nix build --no-update-lock-file --print-build-logs
       - name: Check installed license notices
         run: |
           test -s result/share/licenses/embeddinggemma-kfd/LICENSE

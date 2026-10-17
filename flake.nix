@@ -29,7 +29,7 @@
           export KFD_GPU_COMPILER=${llvm.clang-unwrapped}/bin/clang
           export KFD_GPU_RESOURCE_DIR=${llvm.clang}/resource-root
         '';
-        nativeBuildInputs = native ++ [ pkgs.python3 pkgs.git pkgs.curl pkgs.gitleaks ];
+        nativeBuildInputs = native ++ [ pkgs.python3 pkgs.git pkgs.curl pkgs.gitleaks pkgs.bash pkgs.coreutils ];
         buildInputs = [ pkgs.libdrm ];
       };
     };

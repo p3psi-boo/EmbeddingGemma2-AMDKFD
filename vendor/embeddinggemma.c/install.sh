@@ -3,7 +3,8 @@
 set -eu
 
 repo="QuixiAI/embeddinggemma.c"
-version=${EMBEDDINGGEMMA_VERSION:-latest}
+version=${EMBEDDINGGEMMA_VERSION:-v0.3.1}
+checksums_hash=78692e2cd9f1dae8be68ad9a3425ca97a982a1752605048e9f6516727e198fc8
 variant=${EMBEDDINGGEMMA_VARIANT:-auto}
 install_dir=${EMBEDDINGGEMMA_INSTALL_DIR:-}
 
@@ -16,7 +17,7 @@ Downloads an embeddinggemma release binary and installs it as
 ~/.local/bin/embeddinggemma by default.
 
 Environment overrides:
-  EMBEDDINGGEMMA_VERSION       Release tag, or latest (default: latest)
+  EMBEDDINGGEMMA_VERSION       Pinned release tag (only v0.3.1 in this vendored copy)
   EMBEDDINGGEMMA_VARIANT       auto, cpu, metal, cuda, rocm, or xpu (default: auto)
   EMBEDDINGGEMMA_INSTALL_DIR   Installation directory (default: ~/.local/bin)
 EOF
@@ -124,11 +125,8 @@ case "$platform-$variant" in
     *) die "the $variant variant is not available for $platform-$architecture" ;;
 esac
 
-if [ "$version" = latest ]; then
-    release_url="https://github.com/$repo/releases/latest/download"
-else
-    release_url="https://github.com/$repo/releases/download/$version"
-fi
+[ "$version" = v0.3.1 ] || die "this vendored installer is locked to v0.3.1; update the release and checksum lock together"
+release_url="https://github.com/$repo/releases/download/$version"
 
 download() {
     url=$1
@@ -169,6 +167,8 @@ trap cleanup EXIT HUP INT TERM
 
 checksums=$tmpdir/SHA256SUMS
 download "$release_url/SHA256SUMS" "$checksums"
+[ "$(sha256_file "$checksums")" = "$checksums_hash" ] ||
+    die 'release checksum manifest does not match the pinned SHA-256'
 
 verify_asset() {
     asset=$1

@@ -3,8 +3,8 @@ include(FetchContent)
 FetchContent_Declare(
   Catch2
   GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-  GIT_TAG        v3.13.0
-  GIT_SHALLOW    TRUE
+  GIT_TAG        29c9844f688acb27c87338c39cd186ebfe41aa19 # v3.13.0
+  GIT_SHALLOW    FALSE # A commit pin must also work after the branch advances.
   SYSTEM
 )
 

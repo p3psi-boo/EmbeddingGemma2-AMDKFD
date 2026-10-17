@@ -87,7 +87,7 @@ Or pull the source directly with `FetchContent`:
 include(FetchContent)
 FetchContent_Declare(libkfd
   GIT_REPOSITORY https://github.com/jhuber6/libkfd.git
-  GIT_TAG        master
+  GIT_TAG        dabb4cdeb3bc2354573daa3e3f7afaf7e08ee2e2
 )
 FetchContent_MakeAvailable(libkfd)
 

@@ -12,7 +12,7 @@ static const ei_profile ei_profiles[] = {
      "https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/"
      "bfcd298762cc34d0357ece5ebdd31791a3a374d8/mmproj-embeddinggemma-2-Q8_0.gguf"},
     {"embeddinggemma-300m", "embeddinggemma-300M-qat-Q4_0.gguf",
-     "https://huggingface.co/ggml-org/embeddinggemma-300M-qat-q4_0-GGUF/resolve/main/"
+     "https://huggingface.co/ggml-org/embeddinggemma-300M-qat-q4_0-GGUF/resolve/8dd0ca2a66a8f14470acb0e2a71f801afbc5fb73/"
      "embeddinggemma-300M-qat-Q4_0.gguf",
      NULL, NULL},
 };

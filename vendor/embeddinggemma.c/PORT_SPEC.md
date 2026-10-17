@@ -22,7 +22,7 @@ Acceptance for every backend: cosine ≥ 0.999 against the L2 goldens.
 
 ## Model file
 
-- URL: https://huggingface.co/ggml-org/embeddinggemma-300M-qat-q4_0-GGUF/resolve/main/embeddinggemma-300M-qat-Q4_0.gguf
+- URL: https://huggingface.co/ggml-org/embeddinggemma-300M-qat-q4_0-GGUF/resolve/8dd0ca2a66a8f14470acb0e2a71f801afbc5fb73/embeddinggemma-300M-qat-Q4_0.gguf
 - sha256 `50d28e22432a148f6f8a86eab3700f92add5d1f54baf7790675a2a4dadbccf26`,
   277,852,192 bytes. Local dev copy: `model/embeddinggemma-300M-qat-Q4_0.gguf`
   (gitignored). `hexis init` downloads + verifies it when absent.

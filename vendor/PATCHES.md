@@ -25,7 +25,7 @@ The vendored tree is source, not an automatically updated dependency.
   whole-graph submission exposed illegal PM4 opcodes on gfx90c. The regression
   test decodes 156 padding sizes on CPU; it never sends invalid packets to a GPU.
   Encoding reference: Linux `gfx_v9_ring_insert_nop` in
-  [gfx_v9_0.c](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c).
+  [gfx_v9_0.c](https://github.com/gregkh/linux/blob/v6.18.28/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c).
 
 ## embeddinggemma.c
 
@@ -46,3 +46,14 @@ Upstream CPU graph and tokenizer numerical implementations are unchanged.
 - Remove machine-specific remote access details and personal absolute paths
   from vendored development notes; retain technical guidance and attribution.
 - Preserve upstream licenses; install them alongside the project license.
+
+## Dependency locking
+
+- Pin optional libkfd Catch2 tests to the commit behind v3.13.0; use a full
+  fetch so the commit remains reachable when upstream branches move.
+- Pin the retained upstream CI checkout action and its Linux runner label.
+- Pin the legacy 300M model URL to a Hugging Face revision (not a KFD target).
+- Pin the retained upstream binary installer to v0.3.1 and the SHA-256 of its
+  checksum manifest; reject release overrides that do not match this lock.
+- Replace floating fetch/install examples with the pinned vendored equivalents.
+  These optional upstream paths are not exercised by the KFD package build.

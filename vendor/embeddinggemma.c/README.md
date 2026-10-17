@@ -262,10 +262,12 @@ the same time; the scheduler sends each new wave to an idle device first.
 
 ## Install
 
-Install the latest release as `~/.local/bin/embeddinggemma`:
+This vendored installer is locked to upstream release `v0.3.1` and its checksum
+manifest. It installs the upstream binary, not the KFD backend. From this
+vendor directory, install it as `~/.local/bin/embeddinggemma`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/QuixiAI/embeddinggemma.c/main/install.sh | sh
+sh ./install.sh --version v0.3.1
 ```
 
 The installer detects the host and selects Metal on Apple Silicon or CUDA,
@@ -273,7 +275,7 @@ ROCm, XPU, or CPU on Linux x86_64. It verifies the release checksum before
 replacing an existing installation and falls back to CPU when an accelerator
 runtime is unavailable.
 
-Pin a release, backend, or installation directory when needed:
+Select a backend or installation directory (changing the release requires updating its checksum lock):
 
 ```sh
 ./install.sh --version v0.3.1

@@ -4,7 +4,7 @@ cd "$(dirname "$0")/.."
 target="${1:?usage: deploy-nix.sh SSH_HOST gfx90c|gfx1103}"
 arch="${2:?specify gfx90c or gfx1103}"
 case "$arch" in gfx90c|gfx1103) ;; *) echo "unsupported architecture: $arch" >&2; exit 2;; esac
-nix build --cores "${JOBS:-8}"
+nix build --no-update-lock-file --cores "${JOBS:-8}"
 nix copy --to "ssh://$target" ./result
 package="$(readlink -f result)"
 # No daemon, firewall, driver or host configuration changes.

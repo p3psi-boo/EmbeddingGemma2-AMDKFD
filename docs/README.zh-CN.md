@@ -50,3 +50,10 @@ HTTP 并发 4 的短时测量；不是生产吞吐保证，也不是同机 CPU �
 
 自有代码使用 [WTFPL v2](../LICENSE)；第三方代码保留 Apache-2.0/MIT，
 详见 [第三方声明](../THIRD_PARTY_NOTICES.md)。
+
+## 版本锁定
+
+工具链由固定 nixpkgs revision 和 `flake.lock` 统一锁定；CI action 使用完整
+commit，Nix 安装脚本和模型下载均有 SHA-256 校验。CI 的 Python/Bash 等测试
+工具也来自锁定的 Nix 环境。详见 [依赖锁定清单与边界](dependencies.md)。
+GitHub 托管 VM 的补丁版本、宿主机内核/驱动/固件不由仓库控制。

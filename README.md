@@ -9,7 +9,7 @@ LLVM's AMDGPU backend compiles the kernels ahead of time.
 
 [中文说明](docs/README.zh-CN.md) · [Architecture](docs/architecture.md) ·
 [Benchmarks](docs/benchmarks.md) · [MES investigation](docs/mes.md) ·
-[Contributing](CONTRIBUTING.md)
+[Contributing](CONTRIBUTING.md) · [Dependency locks](docs/dependencies.md)
 
 ## Status
 

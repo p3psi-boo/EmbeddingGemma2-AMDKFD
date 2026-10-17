@@ -1,5 +1,9 @@
 # Release Runbook
 
+> Retained upstream multi-platform release notes. These non-Nix recipes are
+> not the locked KFD build; use the root README and `docs/dependencies.md` for
+> the supported reproducible source/toolchain path.
+
 This runbook publishes one GitHub release containing raw executable files for
 every supported platform. GitHub generates source archives automatically; do
 not wrap binary assets in tarballs or zip files.
