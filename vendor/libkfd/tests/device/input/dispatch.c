@@ -1,0 +1,62 @@
+#include <gpuintrin.h>
+
+__gpu_kernel void nop(void) {}
+
+// Indirect call forces dynamic stack usage.
+static void (*volatile indirect_fn)(unsigned *, unsigned);
+
+__gpu_kernel void use_scratch(unsigned *out) {
+  void (*fn)(unsigned *, unsigned) = indirect_fn;
+  if (fn)
+    fn(out, __gpu_thread_id_x());
+}
+
+static void do_scratch_verify(unsigned *out, unsigned tid) {
+  volatile unsigned buf[16];
+  for (unsigned i = 0; i < 16; ++i)
+    buf[i] = tid + i;
+  unsigned sum = 0;
+  for (unsigned i = 0; i < 16; ++i)
+    sum += buf[i];
+  out[tid] = sum;
+}
+
+__gpu_kernel void verify_scratch(unsigned *out) {
+  void (*volatile fn)(unsigned *, unsigned) = do_scratch_verify;
+  fn(out, __gpu_thread_id_x());
+}
+
+__gpu_kernel void store(unsigned *out) {
+  if (__gpu_thread_id_x() == 0 && __gpu_block_id_x() == 0)
+    *out = 0xCAFEBABE;
+}
+
+__gpu_kernel void fill_local_ids(unsigned *out) {
+  out[__gpu_thread_id_x()] = __gpu_thread_id_x();
+}
+
+__gpu_kernel void fill_wg_ids(unsigned *out) {
+  if (__gpu_thread_id_x() == 0)
+    out[__gpu_block_id_x()] = __gpu_block_id_x();
+}
+
+__gpu_kernel void grid_memset(unsigned *out, unsigned tag) {
+  unsigned gid =
+      __gpu_thread_id_x() + __gpu_block_id_x() * __gpu_num_threads_x();
+  out[gid] = tag;
+}
+
+__gpu_kernel void check_dims(unsigned *out) {
+  if (__gpu_thread_id_x() != 0 || __gpu_thread_id_y() != 0 ||
+      __gpu_thread_id_z() != 0)
+    return;
+  if (__gpu_block_id_x() != 0 || __gpu_block_id_y() != 0 ||
+      __gpu_block_id_z() != 0)
+    return;
+  out[0] = __gpu_num_blocks_x();
+  out[1] = __gpu_num_blocks_y();
+  out[2] = __gpu_num_blocks_z();
+  out[3] = __gpu_num_threads_x();
+  out[4] = __gpu_num_threads_y();
+  out[5] = __gpu_num_threads_z();
+}

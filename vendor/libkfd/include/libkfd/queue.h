@@ -1,0 +1,905 @@
+//===-- libkfd/queue.h - Device command processor queues --------*- C++ -*-===//
+//
+// Queues are the primary way to interact with the device's command processor.
+// These are simple ring buffers that submit packets to the device from user
+// space. PM4 compute queues modify memory and register state, AQL queues hand
+// fixed-size HSA packets to the CP firmware, and SDMA queues handle memory
+// movement. Queue submission is handled through ringing MMIO doorbell pages.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef LIBKFD_QUEUE_H
+#define LIBKFD_QUEUE_H
+
+#include "libkfd/abi.h"
+#include "libkfd/detail/box.h"
+#include "libkfd/detail/mutex.h"
+#include "libkfd/detail/small_vector.h"
+#include "libkfd/detail/utility.h"
+#include "libkfd/device.h"
+#include "libkfd/loader.h"
+#include "libkfd/memory.h"
+#include "libkfd/packets/aql.h"
+#include "libkfd/packets/pm4.h"
+#include "libkfd/packets/sdma.h"
+#include "libkfd/signal.h"
+
+#include "libkfd/error.h"
+
+#include <cstdint>
+#include <cstring>
+#include <optional>
+#include <span>
+
+namespace kfd {
+
+class Context;
+struct AmdQueue;
+struct QueueErrorCtx;
+struct ScratchCtx;
+
+enum class QueueType : uint8_t {
+  COMPUTE = /*KFD_IOC_QUEUE_TYPE_COMPUTE=*/0x0,
+  SDMA = /*KFD_IOC_QUEUE_TYPE_SDMA=*/0x1,
+  COMPUTE_AQL = /*KFD_IOC_QUEUE_TYPE_COMPUTE_AQL=*/0x2,
+  SDMA_XGMI = /*KFD_IOC_QUEUE_TYPE_SDMA_XGMI=*/0x3,
+  SDMA_BY_ENG_ID = /*KFD_IOC_QUEUE_TYPE_SDMA_BY_ENG_ID=*/0x4,
+};
+
+// Shared kernel-facing queue state. ComputeQueue and SDMAQueue each hold one
+// of these and forward through it; users interact with the concrete wrappers.
+class QueueBase {
+public:
+  // Valid KFD queue priorities are 0 (lowest) through 15 (highest).
+  static constexpr uint32_t DEFAULT_PRIORITY = 7;
+
+  // We default to unbounded queue wait time.
+  static constexpr uint64_t DEFAULT_SUBMIT_TIMEOUT_NS = 0;
+
+  ~QueueBase();
+
+  QueueBase(const QueueBase &) = delete;
+  QueueBase &operator=(const QueueBase &) = delete;
+  QueueBase(QueueBase &&other);
+  QueueBase &operator=(QueueBase &&other);
+
+  uint32_t queue_id() const { return id; }
+  size_t ring_dwords() const { return ring.size() / sizeof(uint32_t); }
+  // Non-transactional, read-only diagnostic snapshot (raw engine units).
+  struct Snapshot {
+    uint64_t read_ptr, write_ptr, error_payload;
+    const void *cwsr_address;
+    size_t cwsr_bytes;
+    bool cwsr_svm;
+  };
+  Snapshot snapshot() const {
+    return {__atomic_load_n(&ctl()->read_ptr, __ATOMIC_ACQUIRE),
+            __atomic_load_n(&ctl()->write_ptr, __ATOMIC_ACQUIRE),
+            __atomic_load_n(&ctl()->err_payload, __ATOMIC_ACQUIRE),
+            cwsr ? cwsr.data() : cwsr_bo.data(),
+            cwsr ? cwsr.size() : cwsr_bo.size(), bool(cwsr)};
+  }
+  explicit operator bool() const { return ctx != nullptr; }
+
+  // Returns a rough approximation of the amount of work still in-flight.
+  uint32_t queue_depth() const {
+    uint32_t cap = static_cast<uint32_t>(ring_dwords());
+    uint32_t mask = cap - 1;
+    uint32_t rp = __atomic_load_n(
+        reinterpret_cast<const volatile uint32_t *>(&ctl()->read_ptr),
+        __ATOMIC_ACQUIRE);
+
+    // SDMA engines report their packets in bytes while PM4 uses 32-byte words.
+    if (is_sdma())
+      rp /= sizeof(uint32_t);
+    uint64_t wptr = __atomic_load_n(&pending_wptr, __ATOMIC_ACQUIRE);
+    return ((static_cast<uint32_t>(wptr) & mask) + cap - (rp & mask)) & mask;
+  }
+
+private:
+  friend class ComputeQueue;
+  friend class AQLQueue;
+  friend class SDMAQueue;
+  friend class XGMIQueue;
+
+  // Shared memory written by the kernel/hardware and read by userspace.
+  //
+  // On GFX9+ both wptr and the doorbell are 64-bit. The read_ptr width
+  // depends on the engine:
+  //   - PM4 (MEC):  read is 32-bit in dword units (even on GFX9+).
+  //   - SDMA:       read is 64-bit in byte units on GFX9+.
+  //
+  // We declare read_ptr as uint64_t so the field is large enough for both
+  // cases and expect that no queue will exceed 4 GiB in size. The EOP sequence
+  // is increased monotonically to coordinate end-of-pipe events for signals.
+  //
+  // Compute queues also use this to publish the allocated per-wave scratch
+  // capacity, guard the grow handshake, and hold the sticky scratch IB.
+  static constexpr size_t MAX_SCRATCH_IB_DWORDS = 20;
+  struct QueueControl {
+    uint64_t read_ptr;
+    uint64_t write_ptr;
+    uint64_t eop_seq;
+    uint64_t err_payload;
+    uint64_t scratch_cur;
+    uint64_t scratch_guard;
+    uint32_t scratch_req_perwave;
+    uint32_t scratch_req_block;
+    uint32_t scratch_req_props;
+    uint32_t indirect[MAX_SCRATCH_IB_DWORDS];
+  };
+
+  // AQL queues place the CP-visible amd_queue_t after the control block. Its
+  // read and write dispatch IDs replace the control block's ring pointers.
+  static constexpr size_t AMD_QUEUE_OFFSET =
+      detail::align_up(sizeof(QueueControl), size_t(64));
+
+  static std::expected<QueueBase, Error>
+  create(Device &dev, QueueType type, size_t ring_size,
+         uint32_t priority = DEFAULT_PRIORITY, uint32_t target_xcc = 0,
+         std::optional<uint32_t> engine_id = std::nullopt);
+
+  QueueBase() = default;
+  QueueBase(QueueType type, Context &ctx, Device &dev, uint32_t id,
+            uint32_t priority, uint32_t target_xcc, Buffer control, Buffer ring,
+            Buffer eop, detail::MappedRegion cwsr, Buffer cwsr_bo,
+            volatile uint64_t *doorbell, detail::Box<Event> err_event,
+            detail::Mutex submit_mtx);
+
+  std::expected<void, Error>
+  submit(const uint32_t *data, size_t dwords,
+         uint64_t timeout_ns = DEFAULT_SUBMIT_TIMEOUT_NS);
+  std::expected<void, Error>
+  submit_impl(const uint32_t *data, size_t dwords,
+              uint64_t timeout_ns = DEFAULT_SUBMIT_TIMEOUT_NS);
+
+  QueueControl *ctl() const {
+    return static_cast<QueueControl *>(control.data());
+  }
+  AmdQueue *amd_queue() const;
+  bool is_sdma() const {
+    return type == QueueType::SDMA || type == QueueType::SDMA_XGMI ||
+           type == QueueType::SDMA_BY_ENG_ID;
+  }
+  std::expected<void, Error> set_cu_mask(std::span<const uint32_t> mask);
+  std::span<const uint32_t> cu_mask() const {
+    return {cu_mask_words.data(), cu_mask_words.size()};
+  }
+  // A null ring address disables the queue, so the address from create is
+  // sent back with the new priority.
+  std::expected<void, Error> set_priority(uint32_t priority);
+  uint32_t priority() const { return queue_priority; }
+  std::expected<void, Error>
+  wait_for_room(uint32_t dwords,
+                uint64_t timeout_ns = DEFAULT_SUBMIT_TIMEOUT_NS);
+  static bool queue_error_handler(void *user_data);
+  static bool scratch_handler(void *user_data);
+  static bool inactive_handler(void *user_data);
+  static bool scratch_grow(ScratchCtx *sctx, uint32_t needed_perwave,
+                           uint32_t threads_per_group);
+
+  QueueType type{};
+  Context *ctx = nullptr;
+  Device *dev = nullptr;
+  uint32_t id = 0;
+  uint32_t queue_priority = DEFAULT_PRIORITY;
+  uint32_t target_xcc = 0;
+
+  Buffer control;
+  Buffer ring;
+  Buffer eop;
+  detail::MappedRegion cwsr;
+  Buffer cwsr_bo;
+
+  volatile uint64_t *doorbell = nullptr;
+  detail::Box<Event> err_event;
+  detail::Box<QueueErrorCtx> err_watch_ctx;
+  detail::Box<Event> scratch_event;
+  detail::Box<ScratchCtx> scratch_watch_ctx;
+  detail::Box<Event> inactive_event;
+  detail::Mutex submit_mtx;
+  detail::SmallVector<uint32_t, 8> cu_mask_words;
+
+  uint64_t pending_wptr = 0;
+};
+
+// High level interface into a PM4 queue used to dispatch kernels and
+// communicate with the device.
+class ComputeQueue {
+public:
+  static std::expected<ComputeQueue, Error>
+  create(Device &dev, size_t ring_size = 4ul * detail::page_size(),
+         uint32_t priority = QueueBase::DEFAULT_PRIORITY,
+         uint32_t target_xcc = 0);
+
+  ~ComputeQueue() = default;
+
+  ComputeQueue(const ComputeQueue &) = delete;
+  ComputeQueue &operator=(const ComputeQueue &) = delete;
+  ComputeQueue(ComputeQueue &&) = default;
+  ComputeQueue &operator=(ComputeQueue &&) = default;
+
+  class CommandBuffer {
+  public:
+    CommandBuffer(const CommandBuffer &) = delete;
+    CommandBuffer &operator=(const CommandBuffer &) = delete;
+    CommandBuffer(CommandBuffer &&) = default;
+
+    CommandBuffer &write_data(void *addr, uint32_t value) {
+      uint32_t buf[pm4::WRITE_DATA_DWORDS];
+      pm4::write_data(buf, addr, value);
+      return append(buf, pm4::WRITE_DATA_DWORDS);
+    }
+
+    CommandBuffer &dma_copy(void *dst, const void *src, uint32_t byte_count) {
+      const uint32_t max = queue.gfx_version() >= abi::GFX_VERSION_GFX10_1
+                               ? pm4::DMA_DATA_MAX_BYTES_GFX10
+                               : pm4::DMA_DATA_MAX_BYTES_GFX9;
+      auto *d = static_cast<std::byte *>(dst);
+      auto *s = static_cast<const std::byte *>(src);
+      uint32_t remaining = byte_count;
+      while (remaining) {
+        uint32_t chunk = remaining < max ? remaining : max;
+        uint32_t buf[pm4::DMA_DATA_DWORDS];
+        pm4::dma_data_copy(buf, d, s, chunk);
+        append(buf, pm4::DMA_DATA_DWORDS);
+        d += chunk;
+        s += chunk;
+        remaining -= chunk;
+      }
+      return *this;
+    }
+
+    CommandBuffer &dma_fill(void *dst, uint32_t value, uint32_t byte_count) {
+      const uint32_t max = queue.gfx_version() >= abi::GFX_VERSION_GFX10_1
+                               ? pm4::DMA_DATA_MAX_BYTES_GFX10
+                               : pm4::DMA_DATA_MAX_BYTES_GFX9;
+      auto *d = static_cast<std::byte *>(dst);
+      uint32_t remaining = byte_count;
+      while (remaining) {
+        uint32_t chunk = remaining < max ? remaining : max;
+        uint32_t buf[pm4::DMA_DATA_DWORDS];
+        pm4::dma_data_fill(buf, d, value, chunk);
+        append(buf, pm4::DMA_DATA_DWORDS);
+        d += chunk;
+        remaining -= chunk;
+      }
+      return *this;
+    }
+
+    // The end-of-pipe fence slot is reset first so the wait is never satisfied
+    // by a stale value when the batch is replayed.
+    CommandBuffer &signal(Signal &sig) {
+      uint32_t gfx = queue.gfx_version();
+      void *eop = queue.eop_seq.data();
+      uint32_t buf[pm4::WRITE_DATA_DWORDS + 2 * pm4::RELEASE_MEM_DWORDS +
+                   pm4::WAIT_REG_MEM_DWORDS + pm4::ATOMIC_MEM_DWORDS];
+      uint32_t n = 0;
+      n += pm4::write_data(buf + n, eop, 0);
+      n += pm4::release_mem(buf + n, gfx, eop, uint64_t(1));
+      n += pm4::wait_reg_mem(buf + n, gfx, eop, Condition::GTE, 1);
+      n += pm4::atomic_mem(buf + n, pm4::ATOMIC_ADD_RTN_64, sig.fence_addr(),
+                           int64_t(-1), 0, pm4::ATOMIC_SINGLE_PASS,
+                           pm4::POLICY_BYPASS);
+      n += pm4::release_mem(buf + n, gfx, sig.signal_addr(), sig.event_id(),
+                            sig.trigger_data());
+      return append(buf, n);
+    }
+
+    CommandBuffer &wait(Signal &sig, Condition cond, uint64_t value) {
+      uint32_t buf[pm4::WAIT_REG_MEM64_DWORDS];
+      uint32_t n = pm4::wait_reg_mem(buf, queue.gfx_version(), sig.fence_addr(),
+                                     cond, value);
+      return append(buf, n);
+    }
+
+    CommandBuffer &release_mem(pm4::ReleaseMemFlags flush = pm4::REL_ALL,
+                               void *addr = nullptr, uint64_t value = 0,
+                               Event *event = nullptr) {
+      uint32_t gfx = queue.gfx_version();
+      uint32_t buf[2 * pm4::RELEASE_MEM_DWORDS];
+      uint32_t n = 0;
+
+      // Fence write, or a plain flush-only barrier when no extr arguments
+      // given..
+      if (addr || !event)
+        n += pm4::release_mem(buf, pm4::eop_flush(gfx, flush),
+                              addr ? pm4::DATA_64 : pm4::DATA_NONE,
+                              pm4::INT_NONE, addr, value);
+
+      // Fire the event in a second packet by writing to the signal page
+      // address.
+      if (event)
+        n += pm4::release_mem(
+            buf + n, pm4::eop_flush(gfx, n ? pm4::ReleaseMemFlags(0) : flush),
+            pm4::DATA_64, pm4::INT_DATA_CONFIRM, event->signal_addr(),
+            event->event_id(), event->trigger_data());
+
+      return append(buf, n);
+    }
+
+    CommandBuffer &acquire_mem(pm4::AcquireMemFlags flags = pm4::ACQ_ALL,
+                               const void *range_base = nullptr,
+                               uint64_t range_size = UINT64_MAX) {
+      uint32_t buf[pm4::ACQUIRE_MEM_DWORDS];
+      auto n =
+          pm4::acquire_mem(buf, queue.gfx_version(), flags,
+                           reinterpret_cast<uint64_t>(range_base), range_size);
+      return append(buf, n);
+    }
+
+    template <typename T>
+    CommandBuffer &wait_reg_mem(void *addr, Condition cond, T reference,
+                                T mask = static_cast<T>(~T(0))) {
+      uint32_t buf[pm4::WAIT_REG_MEM64_DWORDS];
+      uint32_t n = pm4::wait_reg_mem(buf, queue.gfx_version(), addr, cond,
+                                     reference, mask);
+      return append(buf, n);
+    }
+
+    CommandBuffer &indirect_buffer(const void *ib_addr,
+                                   uint32_t ib_size_dwords) {
+      uint32_t buf[pm4::INDIRECT_BUFFER_DWORDS];
+      pm4::indirect_buffer(buf, ib_addr, ib_size_dwords);
+      return append(buf, pm4::INDIRECT_BUFFER_DWORDS);
+    }
+
+    CommandBuffer &
+    atomic_mem(pm4::AtomicOp op, void *addr, int64_t src_data,
+               int64_t cmp_data = 0,
+               pm4::AtomicCommand cmd = pm4::ATOMIC_SINGLE_PASS) {
+      uint32_t buf[pm4::ATOMIC_MEM_DWORDS];
+      pm4::atomic_mem(buf, op, addr, src_data, cmp_data, cmd);
+      return append(buf, pm4::ATOMIC_MEM_DWORDS);
+    }
+
+    CommandBuffer &copy_data(pm4::CopyDataSrcSel src_sel, uint64_t src_addr,
+                             pm4::CopyDataDstSel dst_sel, uint64_t dst_addr,
+                             bool count_64 = false, bool wr_confirm = true,
+                             pm4::CachePolicy src_policy = pm4::POLICY_LRU,
+                             pm4::CachePolicy dst_policy = pm4::POLICY_LRU) {
+      uint32_t buf[pm4::COPY_DATA_DWORDS];
+      pm4::copy_data(buf, src_sel, src_addr, dst_sel, dst_addr, count_64,
+                     wr_confirm, src_policy, dst_policy);
+      return append(buf, pm4::COPY_DATA_DWORDS);
+    }
+
+    CommandBuffer &read_gpu_clock(void *dst) {
+      uint32_t buf[pm4::COPY_DATA_DWORDS];
+      pm4::copy_data_gpu_clock(buf, dst);
+      return append(buf, pm4::COPY_DATA_DWORDS);
+    }
+
+    CommandBuffer &dispatch(const Kernel &kernel, const DispatchConfig &cfg,
+                            std::span<std::byte> kernarg) {
+      size_t off = words.size();
+      KFD_ASSERT(words.resize_for_overwrite(off + DISPATCH_DWORDS));
+      uint32_t n =
+          queue.dispatch_impl(words.data() + off, kernel, cfg, kernarg.data());
+      words.truncate(off + n);
+      return *this;
+    }
+
+    std::expected<void, Error>
+    submit(uint64_t timeout_ns = QueueBase::DEFAULT_SUBMIT_TIMEOUT_NS) {
+      return queue.flush(words.data(), words.size(), timeout_ns);
+    }
+
+    void reset() { words.clear(); }
+    size_t size() const { return words.size(); }
+    std::span<const uint32_t> data() const { return {words.data(), words.size()}; }
+    bool empty() const { return words.empty(); }
+
+  private:
+    friend class ComputeQueue;
+
+    explicit CommandBuffer(ComputeQueue &queue) : queue(queue) {}
+
+    CommandBuffer &append(const uint32_t *data, uint32_t n) {
+      KFD_ASSERT(words.append(data, data + n));
+      return *this;
+    }
+
+    ComputeQueue &queue;
+    detail::SmallVector<uint32_t, 256> words;
+  };
+
+  CommandBuffer command() { return CommandBuffer(*this); }
+
+  std::expected<void, Error> write_data(void *addr, uint32_t value) {
+    return command().write_data(addr, value).submit();
+  }
+
+  std::expected<void, Error> dma_copy(void *dst, const void *src,
+                                      uint32_t byte_count) {
+    return command().dma_copy(dst, src, byte_count).submit();
+  }
+
+  std::expected<void, Error> dma_fill(void *dst, uint32_t value,
+                                      uint32_t byte_count) {
+    return command().dma_fill(dst, value, byte_count).submit();
+  }
+
+  // Decrements the signal's value and fires an event once the preceding work
+  // has finished.
+  std::expected<void, Error> signal(Signal &sig) {
+    return command().signal(sig).submit();
+  }
+
+  // Stalls the CP until the signal's value satisfies the condition.
+  std::expected<void, Error> wait(Signal &sig, Condition cond, uint64_t value) {
+    return command().wait(sig, cond, value).submit();
+  }
+
+  // Invalidates the selected caches on the command buffer's end-of-pipe flush.
+  // If present, writes the requested value to the address one completion and
+  // fires an interrupt to the appropriate id.
+  std::expected<void, Error>
+  release_mem(pm4::ReleaseMemFlags flush = pm4::REL_ALL, void *addr = nullptr,
+              uint64_t value = 0, Event *event = nullptr) {
+    return command().release_mem(flush, addr, value, event).submit();
+  }
+
+  // Invalidates the selected caches over the given range. This is required to
+  // properly flush caches if memory has been modified at all.
+  std::expected<void, Error>
+  acquire_mem(pm4::AcquireMemFlags flags = pm4::ACQ_ALL,
+              const void *range_base = nullptr,
+              uint64_t range_size = UINT64_MAX) {
+    return command().acquire_mem(flags, range_base, range_size).submit();
+  }
+
+  template <typename T>
+  std::expected<void, Error> wait_reg_mem(void *addr, Condition cond,
+                                          T reference,
+                                          T mask = static_cast<T>(~T(0))) {
+    return command().wait_reg_mem(addr, cond, reference, mask).submit();
+  }
+
+  std::expected<void, Error> indirect_buffer(const void *ib_addr,
+                                             uint32_t ib_size_dwords) {
+    return command().indirect_buffer(ib_addr, ib_size_dwords).submit();
+  }
+
+  std::expected<void, Error>
+  atomic_mem(pm4::AtomicOp op, void *addr, int64_t src_data,
+             int64_t cmp_data = 0,
+             pm4::AtomicCommand cmd = pm4::ATOMIC_SINGLE_PASS) {
+    return command().atomic_mem(op, addr, src_data, cmp_data, cmd).submit();
+  }
+
+  std::expected<void, Error>
+  copy_data(pm4::CopyDataSrcSel src_sel, uint64_t src_addr,
+            pm4::CopyDataDstSel dst_sel, uint64_t dst_addr,
+            bool count_64 = false, bool wr_confirm = true,
+            pm4::CachePolicy src_policy = pm4::POLICY_LRU,
+            pm4::CachePolicy dst_policy = pm4::POLICY_LRU) {
+    return command()
+        .copy_data(src_sel, src_addr, dst_sel, dst_addr, count_64, wr_confirm,
+                   src_policy, dst_policy)
+        .submit();
+  }
+
+  // Snapshot the GPU's free-running clock counter to an 8-byte-aligned address.
+  std::expected<void, Error> read_gpu_clock(void *dst) {
+    return command().read_gpu_clock(dst).submit();
+  }
+
+  // Dispatches a kernel launch onto the queue.
+  std::expected<void, Error> dispatch(const Kernel &kernel,
+                                      const DispatchConfig &cfg,
+                                      std::span<std::byte> kernarg) {
+    return command().dispatch(kernel, cfg, kernarg).submit();
+  }
+
+  // Sets the bitfield controlling which CUs workgroups can be dispatched to.
+  std::expected<void, Error> set_cu_mask(std::span<const uint32_t> mask) {
+    return base.set_cu_mask(mask);
+  }
+  std::span<const uint32_t> cu_mask() const { return base.cu_mask(); }
+
+  std::expected<void, Error> set_priority(uint32_t priority) {
+    return base.set_priority(priority);
+  }
+  uint32_t priority() const { return base.priority(); }
+
+  uint32_t gfx_version() const { return base.dev->gfx_version(); }
+  uint32_t queue_id() const { return base.queue_id(); }
+  size_t ring_dwords() const { return base.ring_dwords(); }
+  uint32_t queue_depth() const { return base.queue_depth(); }
+  QueueBase::Snapshot snapshot() const { return base.snapshot(); }
+  explicit operator bool() const { return static_cast<bool>(base); }
+
+private:
+  friend class Context;
+  friend class CooperativeQueue;
+
+  static constexpr uint32_t SCRATCH_GUARD_DWORDS =
+      pm4::WRITE_DATA_DWORDS + pm4::COND_WRITE_DWORDS + pm4::COND_EXEC_DWORDS +
+      /*in-band request=*/3 * pm4::WRITE_DATA_DWORDS + pm4::RELEASE_MEM_DWORDS +
+      pm4::WAIT_REG_MEM_DWORDS + pm4::INDIRECT_BUFFER_DWORDS;
+
+  static constexpr uint32_t DISPATCH_DWORDS =
+      pm4::ACQUIRE_MEM_DWORDS + pm4::MAX_DISPATCH_DWORDS +
+      SCRATCH_GUARD_DWORDS + pm4::DISPATCH_DIRECT_DWORDS;
+
+  uint32_t dispatch_impl(uint32_t *out, const Kernel &kernel,
+                         const DispatchConfig &cfg, void *kernarg);
+
+  std::expected<void, Error>
+  flush(const uint32_t *data, size_t dwords,
+        uint64_t timeout_ns = QueueBase::DEFAULT_SUBMIT_TIMEOUT_NS);
+
+  explicit ComputeQueue(QueueBase &&b, Buffer &&vram)
+      : eop_seq(std::move(vram)), base(std::move(b)) {}
+
+  Buffer eop_seq;
+  QueueBase base;
+  bool cooperative = false;
+};
+
+// A compute queue that is exclusively scheduled (non-preemptible). Dispatches
+// must fit in the device's resource limits.
+class CooperativeQueue : public ComputeQueue {
+public:
+  static std::expected<CooperativeQueue, Error>
+  create(Device &dev, size_t ring_size = 4ul * detail::page_size(),
+         uint32_t priority = QueueBase::DEFAULT_PRIORITY,
+         uint32_t target_xcc = 0);
+
+private:
+  explicit CooperativeQueue(ComputeQueue &&cq) : ComputeQueue(std::move(cq)) {
+    cooperative = true;
+  }
+};
+
+// High level interface into an AQL queue used to present work to the device
+// according to the HSA standard.
+class AQLQueue {
+public:
+  static constexpr size_t PACKET_SIZE = 64;
+  QueueBase::Snapshot snapshot() const;
+
+  static std::expected<AQLQueue, Error>
+  create(Device &dev, size_t ring_size = 4ul * detail::page_size(),
+         uint32_t priority = QueueBase::DEFAULT_PRIORITY,
+         uint32_t target_xcc = 0);
+
+  ~AQLQueue() = default;
+
+  AQLQueue(const AQLQueue &) = delete;
+  AQLQueue &operator=(const AQLQueue &) = delete;
+  AQLQueue(AQLQueue &&) = default;
+  AQLQueue &operator=(AQLQueue &&) = default;
+
+  class CommandBuffer {
+  public:
+    CommandBuffer(const CommandBuffer &) = delete;
+    CommandBuffer &operator=(const CommandBuffer &) = delete;
+    CommandBuffer(CommandBuffer &&) = default;
+
+    CommandBuffer &dispatch(const Kernel &kernel, const DispatchConfig &cfg,
+                            std::span<std::byte> kernarg,
+                            aql::Ordering order = {},
+                            Signal *completion = nullptr);
+
+    // Later packets wait until every signal in 'deps' reaches zero. If
+    // non-null, 'completion' is decremented afterwards.
+    CommandBuffer &barrier(std::span<Signal *const> deps,
+                           aql::Ordering order = {},
+                           Signal *completion = nullptr);
+
+    // Vendor packet that runs a PM4 indirect buffer, then decrements
+    // 'completion'.
+    CommandBuffer &pm4(const void *ib, uint32_t dwords, Signal &completion);
+
+    std::expected<void, Error>
+    submit(uint64_t timeout_ns = QueueBase::DEFAULT_SUBMIT_TIMEOUT_NS);
+
+    void reset() {
+      packets.clear();
+      failed.reset();
+    }
+    size_t size() const { return packets.size() / PACKET_SIZE; }
+    bool empty() const { return packets.empty(); }
+
+  private:
+    friend class AQLQueue;
+
+    explicit CommandBuffer(AQLQueue &queue) : queue(queue) {}
+
+    CommandBuffer &append(const void *packet);
+    CommandBuffer &fail(Error error);
+
+    AQLQueue &queue;
+    detail::SmallVector<std::byte, 256> packets;
+    std::optional<Error> failed;
+  };
+
+  CommandBuffer command() { return CommandBuffer(*this); }
+
+  // Launches a kernel on the device.
+  std::expected<void, Error> dispatch(const Kernel &kernel,
+                                      const DispatchConfig &cfg,
+                                      std::span<std::byte> kernarg,
+                                      aql::Ordering order = {},
+                                      Signal *completion = nullptr) {
+    return command().dispatch(kernel, cfg, kernarg, order, completion).submit();
+  }
+
+  // Holds back later packets until every signal in 'deps' reaches zero. If
+  // non-null, 'completion' is decremented afterwards.
+  std::expected<void, Error> barrier(std::span<Signal *const> deps,
+                                     aql::Ordering order = {},
+                                     Signal *completion = nullptr) {
+    return command().barrier(deps, order, completion).submit();
+  }
+
+  // Copies complete 64-byte AQL packets into the ring and rings the doorbell
+  // once. The ring stays inside the queue; the scratch and inactive handlers
+  // write it. 'packets' is empty or a multiple of PACKET_SIZE, and no larger
+  // than the ring.
+  std::expected<void, Error>
+  submit(std::span<const std::byte> packets,
+         uint64_t timeout_ns = QueueBase::DEFAULT_SUBMIT_TIMEOUT_NS);
+
+  // Launch a PM4 packet stream via an indirect buffer.
+  std::expected<void, Error> submit_pm4(const void *ib, uint32_t dwords,
+                                        Signal &completion) {
+    return command().pm4(ib, dwords, completion).submit();
+  }
+
+  // Sets the bitfield controlling which CUs workgroups can be dispatched to.
+  std::expected<void, Error> set_cu_mask(std::span<const uint32_t> mask) {
+    return base.set_cu_mask(mask);
+  }
+  std::span<const uint32_t> cu_mask() const { return base.cu_mask(); }
+
+  std::expected<void, Error> set_priority(uint32_t priority) {
+    return base.set_priority(priority);
+  }
+  uint32_t priority() const { return base.priority(); }
+
+  uint32_t gfx_version() const { return base.dev->gfx_version(); }
+  uint32_t queue_id() const { return base.queue_id(); }
+  explicit operator bool() const { return static_cast<bool>(base); }
+
+  // The command processor's queue descriptor. Its prefix is hsa_queue_t.
+  void *descriptor() const { return base.amd_queue(); }
+
+  // Mapped MMIO register. A store of a packet index makes the CP look.
+  volatile uint64_t *hardware_doorbell() const { return base.doorbell; }
+
+  // Mark the queue exclusively scheduled. GFX12 carries this in the packet.
+  std::expected<void, Error> acquire_gws();
+
+private:
+  explicit AQLQueue(QueueBase &&b) : base(std::move(b)) {}
+
+  QueueBase base;
+};
+
+// A queue used to copy memory between pinned CPU memory and VRAM.
+class SDMAQueue {
+public:
+  // Specifying the engine ID pins the queue to the enumerated hardware slot.
+  static std::expected<SDMAQueue, Error>
+  create(Device &dev, size_t ring_size = detail::page_size(),
+         uint32_t priority = QueueBase::DEFAULT_PRIORITY,
+         std::optional<uint32_t> engine_id = std::nullopt);
+
+  ~SDMAQueue() = default;
+
+  SDMAQueue(const SDMAQueue &) = delete;
+  SDMAQueue &operator=(const SDMAQueue &) = delete;
+  SDMAQueue(SDMAQueue &&) = default;
+  SDMAQueue &operator=(SDMAQueue &&) = default;
+
+  class CommandBuffer {
+  public:
+    CommandBuffer(const CommandBuffer &) = delete;
+    CommandBuffer &operator=(const CommandBuffer &) = delete;
+    CommandBuffer(CommandBuffer &&) = default;
+
+    // Host memory must be in pinned or GTT memory to qualify for DMA transfers.
+    CommandBuffer &copy_linear(void *dst, const void *src, size_t bytes) {
+      const uint32_t max_bytes = sdma::max_copy_linear_bytes(gfx());
+      auto *d = static_cast<char *>(dst);
+      auto *s = static_cast<const char *>(src);
+      while (bytes) {
+        uint32_t chunk =
+            static_cast<uint32_t>(bytes < max_bytes ? bytes : max_bytes);
+        uint32_t buf[sdma::COPY_LINEAR_DWORDS];
+        sdma::copy_linear(buf, d, s, chunk);
+        append(buf, sdma::COPY_LINEAR_DWORDS);
+        d += chunk;
+        s += chunk;
+        bytes -= chunk;
+      }
+      return *this;
+    }
+
+    CommandBuffer &const_fill(void *dst, uint32_t value, size_t bytes) {
+      const uint32_t max_bytes = sdma::max_copy_linear_bytes(gfx()) & ~3u;
+      auto *d = static_cast<char *>(dst);
+      while (bytes) {
+        uint32_t chunk =
+            static_cast<uint32_t>(bytes < max_bytes ? bytes : max_bytes);
+        uint32_t buf[sdma::CONST_FILL_DWORDS];
+        sdma::const_fill(buf, gfx(), d, value, chunk);
+        append(buf, sdma::CONST_FILL_DWORDS);
+        d += chunk;
+        bytes -= chunk;
+      }
+      return *this;
+    }
+
+    CommandBuffer &fence(void *addr, uint32_t value) {
+      uint32_t buf[sdma::FENCE_DWORDS];
+      sdma::fence(buf, gfx(), addr, value);
+      return append(buf, sdma::FENCE_DWORDS);
+    }
+
+    CommandBuffer &flush_caches(uint32_t gcr_cntl = sdma::GCR_FLUSH_ALL) {
+      if (gfx() < abi::GFX_VERSION_GFX10_1)
+        return *this;
+      uint32_t buf[sdma::GCR_REQ_DWORDS];
+      sdma::gcr_req(buf, gcr_cntl);
+      return append(buf, sdma::GCR_REQ_DWORDS);
+    }
+
+    CommandBuffer &poll_regmem(void *addr, Condition cond, uint32_t reference,
+                               uint32_t mask = 0xFFFFFFFF) {
+      uint32_t buf[sdma::POLL_REGMEM_DWORDS];
+      sdma::poll_regmem(buf, addr, cond, reference, mask);
+      return append(buf, sdma::POLL_REGMEM_DWORDS);
+    }
+
+    CommandBuffer &timestamp(void *addr) {
+      uint32_t buf[sdma::TIMESTAMP_DWORDS];
+      sdma::timestamp(buf, addr);
+      return append(buf, sdma::TIMESTAMP_DWORDS);
+    }
+
+    CommandBuffer &atomic_mem(sdma::AtomicOp op, void *addr, int64_t src_data,
+                              int64_t cmp_data = 0) {
+      uint32_t buf[sdma::ATOMIC_DWORDS];
+      sdma::atomic_mem(buf, op, addr, src_data, cmp_data);
+      return append(buf, sdma::ATOMIC_DWORDS);
+    }
+
+    // Decrements the signal's value and fires an event once the preceding work
+    // has finished. Flush the caches to ensure a coherent state at completion.
+    CommandBuffer &signal(Signal &sig) {
+      uint32_t buf[sdma::GCR_REQ_DWORDS + sdma::ATOMIC_DWORDS +
+                   sdma::FENCE_DWORDS + sdma::TRAP_DWORDS];
+      uint32_t n = 0;
+      if (gfx() >= abi::GFX_VERSION_GFX10_1)
+        n += sdma::gcr_req(buf + n);
+      n += sdma::atomic_mem(buf + n, sdma::ATOMIC_ADD_64, sig.fence_addr(), -1);
+      n += sdma::fence(buf + n, gfx(), sig.signal_addr(), sig.event_id());
+      n += sdma::trap(buf + n, sig.trigger_data());
+      return append(buf, n);
+    }
+
+    // Stalls the engine until the fence satisfies the condition. SDMA has no
+    // 64-bit memory poll, so the compared value is 32-bit by construction.
+    CommandBuffer &wait(Signal &sig, Condition cond, uint32_t value) {
+      uint32_t buf[sdma::POLL_REGMEM_DWORDS];
+      sdma::poll_regmem(buf, sig.fence_addr(), cond, value);
+      return append(buf, sdma::POLL_REGMEM_DWORDS);
+    }
+
+    std::expected<void, Error>
+    submit(uint64_t timeout_ns = QueueBase::DEFAULT_SUBMIT_TIMEOUT_NS) {
+      return queue.submit_words(words.data(), words.size(), timeout_ns);
+    }
+
+    void reset() { words.clear(); }
+    size_t size() const { return words.size(); }
+    bool empty() const { return words.empty(); }
+
+  private:
+    friend class SDMAQueue;
+
+    explicit CommandBuffer(SDMAQueue &queue) : queue(queue) {}
+
+    uint32_t gfx() const { return queue.base.dev->gfx_version(); }
+
+    CommandBuffer &append(const uint32_t *data, uint32_t n) {
+      KFD_ASSERT(words.append(data, data + n));
+      return *this;
+    }
+
+    SDMAQueue &queue;
+    detail::SmallVector<uint32_t, 64> words;
+  };
+
+  CommandBuffer command() { return CommandBuffer(*this); }
+
+  // Host memory must be in pinned or GTT memory to qualify for DMA transfers.
+  std::expected<void, Error> copy_linear(void *dst, const void *src,
+                                         size_t bytes) {
+    return command().copy_linear(dst, src, bytes).submit();
+  }
+
+  std::expected<void, Error> const_fill(void *dst, uint32_t value,
+                                        size_t bytes) {
+    return command().const_fill(dst, value, bytes).submit();
+  }
+
+  std::expected<void, Error> fence(void *addr, uint32_t value) {
+    return command().fence(addr, value).submit();
+  }
+
+  std::expected<void, Error>
+  flush_caches(uint32_t gcr_cntl = sdma::GCR_FLUSH_ALL) {
+    return command().flush_caches(gcr_cntl).submit();
+  }
+
+  std::expected<void, Error> poll_regmem(void *addr, Condition cond,
+                                         uint32_t reference,
+                                         uint32_t mask = 0xFFFFFFFF) {
+    return command().poll_regmem(addr, cond, reference, mask).submit();
+  }
+
+  std::expected<void, Error> timestamp(void *addr) {
+    return command().timestamp(addr).submit();
+  }
+
+  std::expected<void, Error> atomic_mem(sdma::AtomicOp op, void *addr,
+                                        int64_t src_data,
+                                        int64_t cmp_data = 0) {
+    return command().atomic_mem(op, addr, src_data, cmp_data).submit();
+  }
+
+  // Decrements the signal's value and fires an event once the preceding work
+  // has finished. Flush the caches to ensure a coherent state at completion.
+  std::expected<void, Error> signal(Signal &sig) {
+    return command().signal(sig).submit();
+  }
+
+  // Stalls the engine until the fence satisfies the condition. SDMA has no
+  // 64-bit memory poll, so the compared value is 32-bit by construction.
+  std::expected<void, Error> wait(Signal &sig, Condition cond, uint32_t value) {
+    return command().wait(sig, cond, value).submit();
+  }
+
+  uint32_t queue_id() const { return base.queue_id(); }
+  size_t ring_dwords() const { return base.ring_dwords(); }
+  uint32_t queue_depth() const { return base.queue_depth(); }
+  std::expected<void, Error> set_priority(uint32_t priority) {
+    return base.set_priority(priority);
+  }
+  uint32_t priority() const { return base.priority(); }
+  explicit operator bool() const { return static_cast<bool>(base); }
+
+private:
+  friend class XGMIQueue;
+
+  explicit SDMAQueue(QueueBase &&b) : base(std::move(b)) {}
+
+  std::expected<void, Error> submit_words(const uint32_t *data, size_t n,
+                                          uint64_t timeout_ns) {
+    return base.submit(data, n, timeout_ns);
+  }
+
+  QueueBase base;
+};
+
+// An SDMA queue used to copy between two XGMI devices instead of PCI(e).
+class XGMIQueue : public SDMAQueue {
+public:
+  // engine_id is the kernel id. XGMI engines follow the PCIe ones.
+  static std::expected<XGMIQueue, Error>
+  create(Device &dev, size_t ring_size = detail::page_size(),
+         uint32_t priority = QueueBase::DEFAULT_PRIORITY,
+         std::optional<uint32_t> engine_id = std::nullopt);
+
+private:
+  explicit XGMIQueue(QueueBase &&b) : SDMAQueue(std::move(b)) {}
+};
+
+} // namespace kfd
+
+#endif // LIBKFD_QUEUE_H

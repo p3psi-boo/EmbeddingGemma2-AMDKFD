@@ -1,0 +1,183 @@
+#include "test_helpers.h"
+
+#include "libkfd/detail/elf.h"
+
+#include <catch2/catch_test_macros.hpp>
+#include <cstring>
+
+TEST_CASE("Context - opens /dev/kfd and reports version", "[context]") {
+  auto ctx = kfd::Context::create();
+  if (!ctx)
+    SKIP("KFD not available: " << kfd::strerror(ctx.error()));
+
+  CHECK(ctx->kfd_fd() >= 0);
+
+  auto ver = ctx->version();
+  REQUIRE_RESULT(ver);
+  CHECK(ver->major >= 1);
+}
+
+TEST_CASE("Context - discovers at least one GPU", "[context]") {
+  auto ctx = kfd::Context::create();
+  if (!ctx)
+    SKIP("KFD not available");
+
+  CHECK(ctx->num_devices() > 0);
+}
+
+TEST_CASE("Context - device initializes lazily on first access", "[context]") {
+  auto ctx = kfd::Context::create();
+  if (!ctx)
+    SKIP("KFD not available");
+  if (ctx->num_devices() == 0)
+    SKIP("No GPUs in topology");
+
+  for (size_t i = 0; i < ctx->num_devices(); ++i) {
+    DYNAMIC_SECTION("device " << i) {
+      auto dev = ctx->device(i);
+      REQUIRE_RESULT(dev);
+      CHECK((*dev)->render_fd() >= 0);
+      CHECK((*dev)->gpu_id() != 0);
+
+      CHECK((*dev)->drm_properties().timestamp_freq != 0);
+      auto stamp = (*dev)->timestamp();
+      REQUIRE_RESULT(stamp);
+      auto later = (*dev)->timestamp();
+      REQUIRE_RESULT(later);
+      CHECK(*later >= *stamp);
+
+      auto avail = (*dev)->available_memory();
+      REQUIRE_RESULT(avail);
+      CHECK(*avail % kfd::detail::page_size() == 0);
+    }
+  }
+}
+
+TEST_CASE("Context - move construction preserves state", "[context]") {
+  auto result = kfd::Context::create();
+  if (!result)
+    SKIP("KFD not available: " << kfd::strerror(result.error()));
+
+  int original_fd = result->kfd_fd();
+  size_t original_ndevs = result->num_devices();
+  size_t original_ncpus = result->cpus().size();
+
+  kfd::Context moved(std::move(*result));
+  CHECK(moved.kfd_fd() == original_fd);
+  CHECK(moved.num_devices() == original_ndevs);
+  CHECK(moved.cpus().size() == original_ncpus);
+
+  for (size_t i = 0; i < moved.num_devices(); ++i) {
+    DYNAMIC_SECTION("device " << i) {
+      auto dev = moved.device(i);
+      REQUIRE_RESULT(dev);
+      CHECK(&(*dev)->context() == &moved);
+      CHECK((*dev)->gpu_id() != 0);
+    }
+  }
+}
+
+TEST_CASE("Context - move assignment preserves state", "[context]") {
+  auto first = kfd::Context::create();
+  if (!first)
+    SKIP("KFD not available: " << kfd::strerror(first.error()));
+
+  auto second = kfd::Context::create();
+  if (!second)
+    SKIP("Second context failed: " << kfd::strerror(second.error()));
+
+  int second_fd = second->kfd_fd();
+  size_t second_ndevs = second->num_devices();
+  size_t second_ncpus = second->cpus().size();
+
+  *first = std::move(*second);
+  CHECK(first->kfd_fd() == second_fd);
+  CHECK(first->num_devices() == second_ndevs);
+  CHECK(first->cpus().size() == second_ncpus);
+
+  for (size_t i = 0; i < first->num_devices(); ++i) {
+    DYNAMIC_SECTION("device " << i) {
+      auto dev = first->device(i);
+      REQUIRE_RESULT(dev);
+      CHECK(&(*dev)->context() == &*first);
+      CHECK((*dev)->gpu_id() != 0);
+    }
+  }
+}
+
+TEST_CASE("Context - multiple contexts coexist", "[context]") {
+  auto a = kfd::Context::create();
+  if (!a)
+    SKIP("KFD not available: " << kfd::strerror(a.error()));
+
+  auto b = kfd::Context::create();
+  REQUIRE_RESULT(b);
+
+  CHECK(a->kfd_fd() != b->kfd_fd());
+  CHECK(a->num_devices() == b->num_devices());
+
+  for (size_t i = 0; i < a->num_devices(); ++i) {
+    DYNAMIC_SECTION("device " << i) {
+      auto dev_a = a->device(i);
+      auto dev_b = b->device(i);
+      REQUIRE_RESULT(dev_a);
+      REQUIRE_RESULT(dev_b);
+      CHECK(&(*dev_a)->context() == &*a);
+      CHECK(&(*dev_b)->context() == &*b);
+      CHECK((*dev_a)->gpu_id() == (*dev_b)->gpu_id());
+    }
+  }
+
+  auto ver_a = a->version();
+  auto ver_b = b->version();
+  REQUIRE_RESULT(ver_a);
+  REQUIRE_RESULT(ver_b);
+  CHECK(ver_a->major == ver_b->major);
+  CHECK(ver_a->minor == ver_b->minor);
+}
+
+TEST_CASE("Context - cpus report cores", "[context]") {
+  auto ctx = kfd::Context::create();
+  if (!ctx)
+    SKIP("KFD not available: " << kfd::strerror(ctx.error()));
+
+  REQUIRE(ctx->cpus().size() >= 1);
+  for (const kfd::Cpu &cpu : ctx->cpus())
+    CHECK(cpu.properties().cpu_cores_count > 0);
+
+  for (size_t i = 0; i < ctx->num_devices(); ++i) {
+    auto dev = ctx->device(i);
+    REQUIRE_RESULT(dev);
+    CHECK((*dev)->gpu_id() != 0);
+  }
+}
+
+TEST_CASE("Context - node properties have reasonable values", "[context]") {
+  auto ctx = kfd::Context::create();
+  if (!ctx)
+    SKIP("KFD not available");
+  if (ctx->num_devices() == 0)
+    SKIP("No GPUs in topology");
+
+  for (size_t i = 0; i < ctx->num_devices(); ++i) {
+    auto dev = ctx->device(i);
+    REQUIRE_RESULT(dev);
+
+    const auto &node = (*dev)->properties();
+    CAPTURE(node.gpu_id, node.device_id);
+    CHECK(node.gpu_id != 0);
+    CHECK(node.vendor_id != 0);
+    CHECK(node.device_id != 0);
+    CHECK(node.gfx_target_version != 0);
+    CHECK(node.drm_render_minor != 0);
+
+    using namespace kfd::detail::elf;
+    uint32_t mach = get_mach(node.gfx_target_version);
+    CHECK(mach != EF_AMDGPU_MACH_NONE);
+    CHECK(get_gfx_version(mach) == node.gfx_target_version);
+
+    char name[16] = {};
+    format_gfx_version(name, sizeof(name), node.gfx_target_version);
+    CHECK(std::string_view(name) == get_name(mach));
+  }
+}

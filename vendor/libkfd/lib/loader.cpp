@@ -1,0 +1,358 @@
+//===-- lib/loader.cpp - Static ELF loader interface ------------*- C++ -*-===//
+//
+// Loads an AMDHSA ELF code object into GPU memory and provides symbol lookup.
+//
+//===----------------------------------------------------------------------===//
+
+#include "libkfd/loader.h"
+
+#include "libkfd/context.h"
+#include "libkfd/detail/mapped_region.h"
+#include "libkfd/detail/utility.h"
+#include "libkfd/queue.h"
+#include "libkfd/signal.h"
+
+#include <cstring>
+#include <utility>
+
+using namespace kfd::detail;
+
+namespace kfd {
+
+MemType Kernel::kernarg_memtype() const {
+  // TODO: Investigate if that can be made to use VRAM, but might require PCIe
+  // ordering changes.
+  return MemType::GTT;
+}
+
+std::expected<Buffer, Error> Kernel::alloc() const {
+  auto buf = KFD_TRY(Buffer::allocate(*dev, kernarg_size(), kernarg_memtype(),
+                                      kernarg_memflags()));
+  if (buf)
+    KFD_CHECK(buf.map(*dev));
+
+  return buf;
+}
+
+void Kernel::fill(std::span<std::byte> region,
+                  std::span<const std::byte> explicit_args,
+                  const DispatchConfig &cfg) const {
+  auto *base = region.data();
+  size_t explicit_size = detail::min(explicit_args.size(), region.size());
+  if (explicit_size && explicit_args.data() != base)
+    std::memcpy(base, explicit_args.data(), explicit_size);
+  if (kd->kernarg_size > explicit_size)
+    std::memset(base + explicit_size, 0, kd->kernarg_size - explicit_size);
+
+  abi::fill_implicit_args(base, explicit_args.size(), *kd, cfg);
+}
+
+std::expected<size_t, Error> Executable::image_size(const void *image) {
+  const auto *ident = static_cast<const uint8_t *>(image);
+  if (ident[elf::EI_MAG0] != elf::ELFMAG0 ||
+      ident[elf::EI_MAG1] != elf::ELFMAG1 ||
+      ident[elf::EI_MAG2] != elf::ELFMAG2 ||
+      ident[elf::EI_MAG3] != elf::ELFMAG3)
+    return unexpected(ENOEXEC, "image is not an ELF object");
+  if (ident[elf::EI_CLASS] != elf::ELFCLASS64)
+    return unexpected(ENOEXEC, "image is not a 64-bit ELF");
+  const auto &eh = *reinterpret_cast<const elf::Elf64_Ehdr *>(image);
+  return static_cast<size_t>(eh.e_shoff) +
+         static_cast<size_t>(eh.e_shentsize) * eh.e_shnum;
+}
+
+namespace {
+
+struct LoadedBinary {
+  MappedRegion file;
+  elf::ELF64LE elf;
+  Buffer vram;
+  MappedRegion host;
+  uint64_t base;
+  uint64_t bytes;
+};
+
+std::expected<LoadedBinary, Error>
+load_binary(Device &dev, std::span<const std::byte> image) {
+  auto region = KFD_TRY(MappedRegion::create(image.size_bytes()));
+  std::memcpy(region.data(), image.data(), image.size_bytes());
+
+  auto elf = KFD_TRY(elf::ELF64LE::create(region.as_span<const std::byte>()));
+
+  if (elf.header().e_machine != elf::EM_AMDGPU)
+    return unexpected(ENOEXEC, "e_machine is not EM_AMDGPU");
+
+  unsigned abi = elf.header().e_ident[elf::EI_ABIVERSION];
+  if (abi < elf::ELFABIVERSION_AMDGPU_HSA_V5)
+    return unexpected(ENOEXEC, "unsupported HSA ABI %d", abi);
+
+  uint32_t mach = elf.header().e_flags & elf::EF_AMDGPU_MACH;
+  bool sramecc =
+      dev.properties().capability & NodeProperties::NODE_CAP_SRAM_EDCSUPPORTED;
+  bool xnack = dev.context().xnack_enabled();
+  if (!elf::is_compatible(elf.header().e_flags, dev.gfx_version(), xnack,
+                          sramecc))
+    return unexpected(
+        ENOEXEC, "ELF e_machine '%s' incompatible with device gfx%u%u%x",
+        elf::get_name(mach).data(), abi::gfx_version_major(dev.gfx_version()),
+        abi::gfx_version_minor(dev.gfx_version()),
+        abi::gfx_version_step(dev.gfx_version()));
+
+  auto extent = KFD_TRY(elf.load_extent());
+  auto &[lo, hi, max_align] = extent;
+
+  max_align = detail::max(max_align, static_cast<uint64_t>(page_size()));
+  uint64_t footprint = align_up(hi - lo, max_align);
+  if (footprint > UINT32_MAX)
+    return unexpected(EFBIG, "image footprint %lu exceeds 4 GiB",
+                      static_cast<unsigned long>(footprint));
+
+  // Allocate GPU VRAM memory for the loaded image to reside in.
+  auto img = KFD_TRY(Buffer::allocate(
+      dev, static_cast<size_t>(footprint), MemType::VRAM,
+      MemFlags::WRITABLE | MemFlags::EXECUTABLE | MemFlags::NO_SUBSTITUTE));
+  KFD_CHECK(img.map(dev));
+
+  // Anonymous pages are zero-filled by the kernel, so BSS tails and
+  // inter-segment gaps are already correct after the memcpy loop.
+  auto staging = KFD_TRY(MappedRegion::create(static_cast<size_t>(footprint)));
+
+  // Copy the program header values into the staging buffer.
+  for (const auto &phdr : elf.phdrs()) {
+    if (phdr.p_type != elf::PT_LOAD || phdr.p_filesz == 0)
+      continue;
+    auto seg = KFD_TRY(elf.segment_data(phdr));
+    uint64_t offset = phdr.p_vaddr - lo;
+    if (offset + phdr.p_filesz > footprint)
+      return unexpected(ERANGE,
+                        "ELF segment at 0x%lx+0x%lx overflows "
+                        "staging buffer of %lu bytes",
+                        static_cast<unsigned long>(offset),
+                        static_cast<unsigned long>(phdr.p_filesz),
+                        static_cast<unsigned long>(footprint));
+    std::memcpy(static_cast<char *>(staging.data()) + offset, seg.data(),
+                static_cast<size_t>(phdr.p_filesz));
+  }
+
+  // The AMDGPU ABI exposes a R_AMDGPU_RELATIVE64 and R_AMDGPU_ABS64 dynamic
+  // relocation. We need to relocate these by simply adding the VRAM base
+  // address to all these symbols listed in the dynamic relocation section.
+  uint64_t load_bias = reinterpret_cast<uintptr_t>(img.data()) - lo;
+  for (const auto &phdr : elf.phdrs()) {
+    if (phdr.p_type != elf::PT_DYNAMIC)
+      continue;
+    auto dyn_data = KFD_TRY(elf.segment_data(phdr));
+    auto dyns =
+        std::span(reinterpret_cast<const elf::Elf64_Dyn *>(dyn_data.data()),
+                  dyn_data.size() / sizeof(elf::Elf64_Dyn));
+
+    uint64_t rela_ptr = 0;
+    uint64_t rela_size = 0;
+    uint64_t symtab_ptr = 0;
+    for (const auto &dyn : dyns) {
+      if (dyn.d_tag == elf::DT_NULL)
+        break;
+      if (dyn.d_tag == elf::DT_RELA)
+        rela_ptr = dyn.d_un.d_ptr;
+      else if (dyn.d_tag == elf::DT_RELASZ)
+        rela_size = dyn.d_un.d_val;
+      else if (dyn.d_tag == elf::DT_SYMTAB)
+        symtab_ptr = dyn.d_un.d_ptr;
+    }
+
+    // The dynamic symbol table lives inside a loaded segment, so it is present
+    // in the staging buffer. Symbol-based relocations need it to resolve their
+    // target addresses.
+    const elf::Elf64_Sym *symtab = nullptr;
+    if (symtab_ptr && symtab_ptr >= lo && symtab_ptr - lo < footprint)
+      symtab = reinterpret_cast<const elf::Elf64_Sym *>(
+          static_cast<const char *>(staging.data()) + symtab_ptr - lo);
+
+    if (rela_ptr && rela_size) {
+      if (rela_ptr < lo || rela_ptr - lo > footprint ||
+          rela_size > footprint - (rela_ptr - lo))
+        return unexpected(ERANGE,
+                          "DT_RELA 0x%lx + 0x%lx overflows staging "
+                          "buffer of %lu bytes (base 0x%lx)",
+                          static_cast<unsigned long>(rela_ptr),
+                          static_cast<unsigned long>(rela_size),
+                          static_cast<unsigned long>(footprint),
+                          static_cast<unsigned long>(lo));
+
+      const auto *rela_table = reinterpret_cast<const elf::Elf64_Rela *>(
+          static_cast<const char *>(staging.data()) + rela_ptr - lo);
+      size_t count = rela_size / sizeof(elf::Elf64_Rela);
+      for (size_t i = 0; i < count; ++i) {
+        const auto &rel = rela_table[i];
+        uint32_t type = rel.get_type();
+
+        uint64_t value;
+        if (type == elf::R_AMDGPU_RELATIVE64) {
+          value = load_bias + static_cast<uint64_t>(rel.r_addend);
+        } else if (type == elf::R_AMDGPU_ABS64) {
+          if (!symtab)
+            return unexpected(ENOEXEC,
+                              "R_AMDGPU_ABS64 relocation without DT_SYMTAB");
+          const elf::Elf64_Sym &sym = symtab[rel.get_symbol()];
+          value =
+              load_bias + sym.st_value + static_cast<uint64_t>(rel.r_addend);
+        } else {
+          continue;
+        }
+
+        if (rel.r_offset < lo)
+          continue;
+        uint64_t off = rel.r_offset - lo;
+        if (off + sizeof(uint64_t) <= footprint)
+          std::memcpy(static_cast<char *>(staging.data()) + off, &value,
+                      sizeof(uint64_t));
+      }
+    }
+    break;
+  }
+
+  return LoadedBinary{
+      std::move(region), std::move(elf), std::move(img), std::move(staging), lo,
+      footprint};
+}
+
+} // namespace
+
+std::expected<Executable, Error>
+Executable::load(Device &dev, std::span<const std::byte> image,
+                 ComputeQueue &compute) {
+  auto bin = KFD_TRY(load_binary(dev, image));
+  auto host = KFD_TRY(Buffer::pin_region(
+      dev, std::move(bin.host), MemFlags::WRITABLE | MemFlags::EXECUTABLE));
+  KFD_CHECK(host.map(dev));
+  auto sig = KFD_TRY(Signal::create(dev.context(), /*initial=*/1));
+  KFD_CHECK(compute
+                .command()
+                // DMA transfer of the entire footprint from staging into VRAM.
+                .dma_copy(bin.vram.data(), host.data(),
+                          static_cast<uint32_t>(bin.bytes))
+                // Invalidate instruction caches so the CUs fetch fresh code
+                // from VRAM rather than stale cache lines.
+                .acquire_mem(pm4::ACQ_ICACHE, bin.vram.data(), bin.bytes)
+                .signal(sig)
+                .submit());
+  // Wait on all pending operations to complete.
+  KFD_CHECK(sig.wait(Condition::EQ, /*value=*/0, UINT64_MAX));
+  return Executable(std::move(bin.file), std::move(bin.elf),
+                    std::move(bin.vram), bin.base);
+}
+
+std::expected<Executable, Error>
+Executable::load(Device &dev, std::span<const std::byte> image, AQLQueue &aql,
+                 SDMAQueue &sdma) {
+  auto bin = KFD_TRY(load_binary(dev, image));
+  auto host = KFD_TRY(Buffer::pin_region(
+      dev, std::move(bin.host), MemFlags::WRITABLE | MemFlags::EXECUTABLE));
+  KFD_CHECK(host.map(dev));
+  auto sig = KFD_TRY(Signal::create(dev.context(), /*initial=*/1));
+  KFD_CHECK(sdma.copy_linear(bin.vram.data(), host.data(),
+                             static_cast<size_t>(bin.bytes)));
+  KFD_CHECK(sdma.signal(sig));
+  KFD_CHECK(sig.wait(Condition::EQ, /*value=*/0, UINT64_MAX));
+
+  // SDMA has no ACQUIRE_MEM on GFX9. The vendor packet only holds the jump;
+  // the acquire itself lives in a buffer the CP fetches after the copy retires.
+  uint32_t ib[pm4::ACQUIRE_MEM_DWORDS];
+  uint32_t n =
+      pm4::acquire_mem(ib, dev.gfx_version(), pm4::ACQ_ICACHE,
+                       reinterpret_cast<uintptr_t>(bin.vram.data()), bin.bytes);
+  auto ib_buf = KFD_TRY(Buffer::allocate(
+      dev, n * sizeof(uint32_t), MemType::GTT,
+      MemFlags::WRITABLE | MemFlags::EXECUTABLE | MemFlags::COHERENT |
+          MemFlags::UNCACHED | MemFlags::NO_SUBSTITUTE));
+  KFD_CHECK(ib_buf.map(dev));
+  std::memcpy(ib_buf.data(), ib, n * sizeof(uint32_t));
+
+  KFD_CHECK(sig.reset(1));
+  KFD_CHECK(aql.submit_pm4(ib_buf.data(), n, sig));
+  KFD_CHECK(sig.wait(Condition::EQ, /*value=*/0, UINT64_MAX));
+  return Executable(std::move(bin.file), std::move(bin.elf),
+                    std::move(bin.vram), bin.base);
+}
+
+std::expected<std::span<std::byte>, Error>
+Executable::symbol(std::string_view name) const {
+  auto sym = KFD_TRY(elf.find_symbol(name));
+  if (!sym)
+    return unexpected(ENOENT, "symbol '%.*s' not found",
+                      static_cast<int>(name.size()), name.data());
+
+  if (sym->st_value < base_vaddr)
+    return unexpected(ERANGE, "symbol '%.*s' st_value 0x%lx below base 0x%lx",
+                      static_cast<int>(name.size()), name.data(),
+                      static_cast<unsigned long>(sym->st_value),
+                      static_cast<unsigned long>(base_vaddr));
+  uint64_t off = sym->st_value - base_vaddr;
+  if (off > image.size() || sym->st_size > image.size() - off)
+    return unexpected(ERANGE,
+                      "symbol '%.*s' at offset 0x%lx + size 0x%lx overflows "
+                      "image of %zu bytes",
+                      static_cast<int>(name.size()), name.data(),
+                      static_cast<unsigned long>(off),
+                      static_cast<unsigned long>(sym->st_size), image.size());
+
+  auto *ptr = static_cast<std::byte *>(image.data()) + off;
+  return std::span{ptr, sym->st_size};
+}
+
+std::expected<Kernel, Error> Executable::kernel(std::string_view name) const {
+  auto sym = KFD_TRY(elf.find_symbol(name));
+  if (!sym)
+    return unexpected(ENOENT, "symbol '%.*s' not found",
+                      static_cast<int>(name.size()), name.data());
+  if (sym->st_size < sizeof(abi::KernelDescriptor))
+    return unexpected(EINVAL, "symbol '%.*s' too small for type",
+                      static_cast<int>(name.size()), name.data());
+  if (sym->get_type() != elf::STT_OBJECT || !name.ends_with(".kd"))
+    return unexpected(EINVAL, "symbol '%.*s' not a kernel descriptor",
+                      static_cast<int>(name.size()), name.data());
+
+  if (sym->st_value < base_vaddr)
+    return unexpected(ERANGE, "kernel '%.*s' st_value 0x%lx below base 0x%lx",
+                      static_cast<int>(name.size()), name.data(),
+                      static_cast<unsigned long>(sym->st_value),
+                      static_cast<unsigned long>(base_vaddr));
+  uint64_t kd_off = sym->st_value - base_vaddr;
+  if (kd_off > image.size() || sym->st_size > image.size() - kd_off)
+    return unexpected(ERANGE,
+                      "kernel '%.*s' at offset 0x%lx + size 0x%lx overflows "
+                      "image of %zu bytes",
+                      static_cast<int>(name.size()), name.data(),
+                      static_cast<unsigned long>(kd_off),
+                      static_cast<unsigned long>(sym->st_size), image.size());
+
+  auto descriptor = KFD_TRY(elf.symbol_address(*sym));
+  const abi::KernelDescriptor *kd =
+      reinterpret_cast<const abi::KernelDescriptor *>(descriptor);
+
+  // Reject a non-native wave size (e.g. -mwavefrontsize64 on an RDNA target).
+  uint32_t gfx = image.owner().gfx_version();
+  bool wave32 = kd->kernel_code_properties & abi::ENABLE_WAVEFRONT_SIZE32;
+  if (wave32 != (abi::native_wave_size(gfx) == 32))
+    return unexpected(ENOTSUP,
+                      "kernel '%.*s' is wave%u but gfx%u%u%x is wave%u; "
+                      "non-native wave sizes are unsupported",
+                      static_cast<int>(name.size()), name.data(),
+                      wave32 ? 32u : 64u, abi::gfx_version_major(gfx),
+                      abi::gfx_version_minor(gfx), abi::gfx_version_step(gfx),
+                      abi::native_wave_size(gfx));
+
+  int64_t entry_off =
+      kd->kernel_code_entry_byte_offset + static_cast<int64_t>(kd_off);
+  if (entry_off < 0 || static_cast<uint64_t>(entry_off) >= image.size())
+    return unexpected(ERANGE,
+                      "kernel '%.*s' entry offset 0x%lx outside image "
+                      "of %zu bytes",
+                      static_cast<int>(name.size()), name.data(),
+                      static_cast<unsigned long>(entry_off), image.size());
+
+  return Kernel(kd, static_cast<std::byte *>(image.data()) + entry_off,
+                &image.owner());
+}
+
+} // namespace kfd

@@ -1,0 +1,16 @@
+{
+  "test": "http_parity",
+  "long": true,
+  "tokens": 1038,
+  "cpu_cosines": [
+    0.9998687901875911,
+    0.9999398746099946
+  ],
+  "single_batch_cosines": [
+    1.0,
+    1.0
+  ],
+  "gpu_request_seconds": 1.3390842247754335,
+  "cpu_request_seconds": 2.536544868722558,
+  "note": "Correctness run, different CPU/GPU hosts; not a speedup benchmark."
+}

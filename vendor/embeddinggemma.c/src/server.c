@@ -1,0 +1,2144 @@
+#define _POSIX_C_SOURCE 200809L
+
+#include "engine.h"
+#include "profiles.h"
+#include "media.h"
+#if defined(EI_ENABLE_METAL)
+#include "gemma2_metal.h"
+#endif
+#if defined(EI_ENABLE_CUDA)
+#include "gemma2_cuda.h"
+#endif
+#include "float_format.h"
+#include "http_docs.h"
+#include "inference_service.h"
+#include "response_cache.h"
+#if defined(EI_ENABLE_CUDA)
+#include "gemma2_cuda.h"
+#endif
+
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <errno.h>
+#include <limits.h>
+#include <math.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/uio.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static pthread_mutex_t inference_mutex = PTHREAD_MUTEX_INITIALIZER;
+// GPU media contexts (vision/audio towers and the mixed-input text forward):
+// each slot is a clone sharing the device, pipelines and weights with its own
+// queue, workspace and lock, so media requests overlap on the GPU instead of
+// serializing on inference_mutex. Text waves never touch these contexts.
+#define EI_MAX_MEDIA_SLOTS 8
+typedef struct {
+    void *metal, *cuda;
+    pthread_mutex_t lock;
+    _Atomic size_t busy; /* requests assigned to this slot */
+} media_slot;
+static media_slot media_slots[EI_MAX_MEDIA_SLOTS];
+static size_t media_slot_count;
+static _Atomic size_t media_slot_next;
+// The least-loaded slot (round robin among ties); release with media_slot_release.
+static media_slot *media_slot_acquire(void) {
+    size_t count = media_slot_count;
+    if (!count || count > EI_MAX_MEDIA_SLOTS) return NULL;
+    size_t start = atomic_fetch_add(&media_slot_next, 1) % count;
+    media_slot *best = &media_slots[start];
+    for (size_t i = 1; i < count; i++) {
+        media_slot *slot = &media_slots[(start + i) % count];
+        if (atomic_load(&slot->busy) < atomic_load(&best->busy)) best = slot;
+    }
+    atomic_fetch_add(&best->busy, 1);
+    return best;
+}
+static void media_slot_release(media_slot *slot) {
+    if (slot) atomic_fetch_sub(&slot->busy, 1);
+}
+#if defined(EI_ENABLE_METAL)
+// Media finishes: the text pass over a media request's assembled input rows.
+// Requests queue here and one thread runs every queued finish as a packed wave
+// on its own context, so concurrent media requests share the per-wave cost
+// instead of each paying a batch-of-1 forward. EI_MEDIA_FINISH_BATCH=0 disables.
+typedef struct media_finish {
+    const float *inputs;
+    size_t n;
+    float *out;
+    bool done, ok;
+    char err[256];
+    struct media_finish *next;
+} media_finish;
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t ready, done;
+    media_finish *head, *tail;
+    void *ctx;
+    bool enabled;
+} media_finisher = {.mu = PTHREAD_MUTEX_INITIALIZER,
+                    .ready = PTHREAD_COND_INITIALIZER,
+                    .done = PTHREAD_COND_INITIALIZER};
+static void *media_finisher_run(void *arg) {
+    (void)arg;
+    size_t cap = 0;
+    float *rows = NULL, *outs = NULL;
+    size_t *offsets = NULL;
+    media_finish **items = NULL;
+    for (;;) {
+        pthread_mutex_lock(&media_finisher.mu);
+        while (!media_finisher.head) pthread_cond_wait(&media_finisher.ready, &media_finisher.mu);
+        size_t batch = 0, tokens = 0;
+        for (media_finish *f = media_finisher.head; f && batch < 64 && tokens + f->n <= 8192;
+             f = f->next) {
+            batch++;
+            tokens += f->n;
+        }
+        if (!batch) { /* one over-long finish runs alone */
+            batch = 1;
+            tokens = media_finisher.head->n;
+        }
+        if (batch > cap) {
+            cap = batch;
+            items = realloc(items, cap * sizeof *items);
+            offsets = realloc(offsets, (cap + 1) * sizeof *offsets);
+            outs = realloc(outs, cap * 768 * sizeof *outs);
+        }
+        for (size_t i = 0; i < batch; i++) {
+            items[i] = media_finisher.head;
+            media_finisher.head = media_finisher.head->next;
+        }
+        if (!media_finisher.head) media_finisher.tail = NULL;
+        pthread_mutex_unlock(&media_finisher.mu);
+        rows = realloc(rows, tokens * 512 * sizeof *rows);
+        offsets[0] = 0;
+        for (size_t i = 0; i < batch; i++) {
+            memcpy(rows + offsets[i] * 512, items[i]->inputs, items[i]->n * 512 * sizeof *rows);
+            offsets[i + 1] = offsets[i] + items[i]->n;
+        }
+        char err[256] = "";
+        bool ok = ei_gemma2_metal_batch_inputs(media_finisher.ctx, rows, offsets, batch, outs, err,
+                                               sizeof err);
+        pthread_mutex_lock(&media_finisher.mu);
+        for (size_t i = 0; i < batch; i++) {
+            if (ok) memcpy(items[i]->out, outs + i * 768, 768 * sizeof *outs);
+            else snprintf(items[i]->err, sizeof items[i]->err, "%s", err);
+            items[i]->ok = ok;
+            items[i]->done = true;
+        }
+        pthread_cond_broadcast(&media_finisher.done);
+        pthread_mutex_unlock(&media_finisher.mu);
+    }
+    return NULL;
+}
+static bool media_finish_submit(void *ctx, const float *inputs, size_t n, float *out, char *err,
+                                size_t err_len) {
+    (void)ctx;
+    media_finish f = {.inputs = inputs, .n = n, .out = out};
+    pthread_mutex_lock(&media_finisher.mu);
+    if (media_finisher.tail) media_finisher.tail->next = &f;
+    else media_finisher.head = &f;
+    media_finisher.tail = &f;
+    pthread_cond_signal(&media_finisher.ready);
+    while (!f.done) pthread_cond_wait(&media_finisher.done, &media_finisher.mu);
+    pthread_mutex_unlock(&media_finisher.mu);
+    if (!f.ok) snprintf(err, err_len, "%s", f.err);
+    return f.ok;
+}
+// Audio towers: concurrent requests' clips queue here and one thread encodes
+// every queued clip as one packed wave on its own context (the tower is 1.35x
+// at two clips and 1.48x from four up). EI_MEDIA_AUDIO_BATCH=0 disables.
+typedef struct media_audio_job {
+    const float *mel;
+    int frames;
+    float *out; /* malloc'd rows on success */
+    size_t n;
+    bool done, ok;
+    char err[256];
+    struct media_audio_job *next;
+} media_audio_job;
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t ready, done;
+    media_audio_job *head, *tail;
+    void *ctx;
+    const ei_gguf *projector;
+    bool enabled;
+} media_audio_batcher = {.mu = PTHREAD_MUTEX_INITIALIZER,
+                         .ready = PTHREAD_COND_INITIALIZER,
+                         .done = PTHREAD_COND_INITIALIZER};
+static void *media_audio_batcher_run(void *arg) {
+    (void)arg;
+    media_audio_job *items[64];
+    const float *mels[64];
+    int frames[64];
+    for (;;) {
+        pthread_mutex_lock(&media_audio_batcher.mu);
+        while (!media_audio_batcher.head)
+            pthread_cond_wait(&media_audio_batcher.ready, &media_audio_batcher.mu);
+        size_t batch = 0, total = 0;
+        for (media_audio_job *j = media_audio_batcher.head;
+             j && batch < 64 && total + (size_t)j->frames <= EI_GEMMA2_AUDIO_WAVE_FRAMES;
+             j = j->next) {
+            batch++;
+            total += (size_t)j->frames;
+        }
+        if (!batch) batch = 1; /* an over-long clip runs alone and reports the limit */
+        for (size_t i = 0; i < batch; i++) {
+            items[i] = media_audio_batcher.head;
+            mels[i] = items[i]->mel;
+            frames[i] = items[i]->frames;
+            media_audio_batcher.head = media_audio_batcher.head->next;
+        }
+        if (!media_audio_batcher.head) media_audio_batcher.tail = NULL;
+        pthread_mutex_unlock(&media_audio_batcher.mu);
+        float *rows = NULL;
+        size_t n = 0;
+        char err[256] = "";
+        bool ok = ei_gemma2_metal_audio_clips(media_audio_batcher.ctx, media_audio_batcher.projector,
+                                              mels, frames, (int)batch, &rows, &n, err, sizeof err);
+        pthread_mutex_lock(&media_audio_batcher.mu);
+        for (size_t i = 0, at = 0; i < batch; i++) {
+            size_t each = (size_t)(frames[i] + 3) / 4;
+            if (ok) {
+                items[i]->out = ei_xmalloc(each * 512 * sizeof *rows);
+                memcpy(items[i]->out, rows + at * 512, each * 512 * sizeof *rows);
+                items[i]->n = each;
+                at += each;
+            } else
+                snprintf(items[i]->err, sizeof items[i]->err, "%s", err);
+            items[i]->ok = ok;
+            items[i]->done = true;
+        }
+        pthread_cond_broadcast(&media_audio_batcher.done);
+        pthread_mutex_unlock(&media_audio_batcher.mu);
+        free(rows);
+    }
+    return NULL;
+}
+static bool media_audio_submit(void *ctx, const float *mel, int frames, float **out, size_t *n,
+                               char *err, size_t err_len) {
+    (void)ctx;
+    media_audio_job j = {.mel = mel, .frames = frames};
+    pthread_mutex_lock(&media_audio_batcher.mu);
+    if (media_audio_batcher.tail) media_audio_batcher.tail->next = &j;
+    else media_audio_batcher.head = &j;
+    media_audio_batcher.tail = &j;
+    pthread_cond_signal(&media_audio_batcher.ready);
+    while (!j.done) pthread_cond_wait(&media_audio_batcher.done, &media_audio_batcher.mu);
+    pthread_mutex_unlock(&media_audio_batcher.mu);
+    if (!j.ok) {
+        snprintf(err, err_len, "%s", j.err);
+        return false;
+    }
+    *out = j.out;
+    *n = j.n;
+    return true;
+}
+#endif
+#define EMBEDDINGGEMMA_DEFAULT_PORT 42666
+#define MAX_BODY_BYTES (16u * 1024u * 1024u)
+#define MAX_HEADER_BYTES (64u * 1024u)
+
+extern char **environ;
+
+#if defined(EI_ENABLE_ROCM)
+#define DEFAULT_INFERENCE_BACKEND "rocm"
+#elif defined(EI_ENABLE_XPU)
+#define DEFAULT_INFERENCE_BACKEND "xpu"
+#elif defined(EI_ENABLE_CUDA)
+#define DEFAULT_INFERENCE_BACKEND "cuda"
+#elif defined(EI_ENABLE_METAL)
+#define DEFAULT_INFERENCE_BACKEND "metal"
+#else
+#define DEFAULT_INFERENCE_BACKEND "cpu"
+#endif
+
+typedef struct {
+    char  *s;
+    size_t len;
+} sv_string;
+
+typedef struct {
+    sv_string *items;
+    bool *structured;
+    size_t n;
+} string_list;
+
+typedef enum {
+    EMBEDDING_ENCODING_FLOAT,
+    EMBEDDING_ENCODING_BASE64,
+} embedding_encoding;
+
+typedef enum {
+    EMBEDDING_API_NATIVE,
+    EMBEDDING_API_OPENAI,
+} embedding_api;
+
+typedef struct {
+    char *data;
+    size_t n;
+    size_t cap;
+} sbuf;
+
+typedef struct {
+    const char *bind_host;
+    int port;
+    const char *backend;
+    const char *model_path;
+    bool text_only;
+    const char *projector_path;
+    const ei_profile *profile;
+    ei_engine *engine;
+    ei_gguf *projector;
+    bool profile_explicit;
+    bool batch_tokens_explicit;
+    bool workers_explicit;
+    bool keepalive_explicit;
+    size_t workers;
+    size_t max_queue;
+    size_t cache_entries;
+    size_t max_batch_tokens;
+    size_t max_batch_requests;
+    size_t max_batch_sequence_tokens;
+    size_t pipeline_slots;
+    size_t media_slots;
+    size_t media_cache_bytes;
+    size_t short_bypass_tokens;
+    size_t threads;              /* 0: EI_THREADS or the default */
+    size_t cpu_workers;          /* 0: none beside a GPU, the engine itself on CPU */
+    size_t cpu_max_batch_tokens;
+    size_t cpu_max_sequence_tokens;
+    bool cpu_pin;
+    int cuda_devices[EI_MAX_EXECUTORS];
+    size_t cuda_device_count;
+    bool cuda_all_devices;
+    size_t max_client_batch_size;
+    size_t tokenizer_workers;
+    uint32_t batch_wait_us;
+    size_t keepalive_connections;
+    size_t keepalive_max_requests;
+    uint32_t keepalive_timeout_ms;
+    size_t response_cache_bytes;
+    const char *persistent_cache_path;
+} server_opts;
+
+static void sbuf_reserve(sbuf *b, size_t additional) {
+    size_t required = b->n + additional + 1u;
+    if (required <= b->cap) return;
+    size_t capacity = b->cap ? b->cap : 4096u;
+    while (capacity < required) capacity *= 2u;
+    b->data = ei_xrealloc(b->data, capacity);
+    b->cap = capacity;
+}
+
+static void sbuf_append(sbuf *b, const char *s, size_t n) {
+    sbuf_reserve(b, n);
+    memcpy(b->data + b->n, s, n);
+    b->n += n;
+    b->data[b->n] = '\0';
+}
+
+static void sbuf_append_z(sbuf *b, const char *s) {
+    sbuf_append(b, s, strlen(s));
+}
+
+static void sbuf_append_json_string(sbuf *b, const char *s, size_t n) {
+    sbuf_append_z(b, "\"");
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        char tmp[8];
+        switch (c) {
+            case '"': sbuf_append_z(b, "\\\""); break;
+            case '\\': sbuf_append_z(b, "\\\\"); break;
+            case '\b': sbuf_append_z(b, "\\b"); break;
+            case '\f': sbuf_append_z(b, "\\f"); break;
+            case '\n': sbuf_append_z(b, "\\n"); break;
+            case '\r': sbuf_append_z(b, "\\r"); break;
+            case '\t': sbuf_append_z(b, "\\t"); break;
+            default:
+                if (c < 0x20) {
+                    snprintf(tmp, sizeof tmp, "\\u%04x", c);
+                    sbuf_append_z(b, tmp);
+                } else {
+                    sbuf_append(b, (const char *)&c, 1);
+                }
+        }
+    }
+    sbuf_append_z(b, "\"");
+}
+
+static void sbuf_append_base64_f32(sbuf *b, const float *values, size_t count) {
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    uint8_t raw[EI_N_EMBD * sizeof(float)];
+    for (size_t i = 0; i < count; i++) {
+        uint32_t bits;
+        memcpy(&bits, values + i, sizeof bits);
+        raw[i * 4u] = (uint8_t)bits;
+        raw[i * 4u + 1u] = (uint8_t)(bits >> 8);
+        raw[i * 4u + 2u] = (uint8_t)(bits >> 16);
+        raw[i * 4u + 3u] = (uint8_t)(bits >> 24);
+    }
+
+    const size_t raw_len = count * sizeof(float);
+    const size_t encoded_len = 4u * ((raw_len + 2u) / 3u);
+    sbuf_reserve(b, encoded_len);
+    char *dst = b->data + b->n;
+    size_t out = 0;
+    for (size_t i = 0; i < raw_len; i += 3u) {
+        const uint32_t a = raw[i];
+        const uint32_t c1 = i + 1u < raw_len ? raw[i + 1u] : 0u;
+        const uint32_t c2 = i + 2u < raw_len ? raw[i + 2u] : 0u;
+        dst[out++] = alphabet[a >> 2];
+        dst[out++] = alphabet[((a & 3u) << 4) | (c1 >> 4)];
+        dst[out++] = i + 1u < raw_len
+            ? alphabet[((c1 & 15u) << 2) | (c2 >> 6)] : '=';
+        dst[out++] = i + 2u < raw_len ? alphabet[c2 & 63u] : '=';
+    }
+    b->n += encoded_len;
+    b->data[b->n] = '\0';
+}
+
+static void skip_ws(const char **p) {
+    while (isspace((unsigned char)**p)) (*p)++;
+}
+
+static uint32_t hex4(const char *p, char *err, size_t err_len) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; i++) {
+        char c = p[i];
+        v <<= 4;
+        if (c >= '0' && c <= '9') v |= (uint32_t)(c - '0');
+        else if (c >= 'a' && c <= 'f') v |= (uint32_t)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v |= (uint32_t)(c - 'A' + 10);
+        else {
+            snprintf(err, err_len, "invalid unicode escape in JSON string");
+            return UINT32_MAX;
+        }
+    }
+    return v;
+}
+
+static void append_byte(char **buf, size_t *n, size_t *cap, uint8_t c) {
+    if (*n + 2u > *cap) {
+        *cap = *cap ? *cap * 2u : 64u;
+        *buf = ei_xrealloc(*buf, *cap);
+    }
+    (*buf)[(*n)++] = (char)c;
+    (*buf)[*n] = '\0';
+}
+
+static void append_utf8(char **buf, size_t *n, size_t *cap, uint32_t cp) {
+    if (cp <= 0x7Fu) {
+        append_byte(buf, n, cap, (uint8_t)cp);
+    } else if (cp <= 0x7FFu) {
+        append_byte(buf, n, cap, (uint8_t)(0xC0u | (cp >> 6)));
+        append_byte(buf, n, cap, (uint8_t)(0x80u | (cp & 0x3Fu)));
+    } else if (cp <= 0xFFFFu) {
+        append_byte(buf, n, cap, (uint8_t)(0xE0u | (cp >> 12)));
+        append_byte(buf, n, cap, (uint8_t)(0x80u | ((cp >> 6) & 0x3Fu)));
+        append_byte(buf, n, cap, (uint8_t)(0x80u | (cp & 0x3Fu)));
+    } else {
+        append_byte(buf, n, cap, (uint8_t)(0xF0u | (cp >> 18)));
+        append_byte(buf, n, cap, (uint8_t)(0x80u | ((cp >> 12) & 0x3Fu)));
+        append_byte(buf, n, cap, (uint8_t)(0x80u | ((cp >> 6) & 0x3Fu)));
+        append_byte(buf, n, cap, (uint8_t)(0x80u | (cp & 0x3Fu)));
+    }
+}
+
+static bool parse_json_string(const char **p, sv_string *out, char *err, size_t err_len) {
+    skip_ws(p);
+    if (**p != '"') {
+        snprintf(err, err_len, "expected JSON string");
+        return false;
+    }
+    (*p)++;
+
+    char *buf = NULL;
+    size_t n = 0;
+    size_t cap = 0;
+    while (**p && **p != '"') {
+        unsigned char c = (unsigned char)**p;
+        if (c != '\\') {
+            /* A run of plain bytes (a base64 payload is one run of up to
+             * megabytes) copies at memcpy speed instead of a byte at a time. */
+            size_t run = strcspn(*p, "\"\\");
+            if (n + run + 1u > cap) {
+                cap = cap ? cap : 64u;
+                while (n + run + 1u > cap) cap *= 2u;
+                buf = ei_xrealloc(buf, cap);
+            }
+            memcpy(buf + n, *p, run);
+            n += run;
+            buf[n] = '\0';
+            *p += run;
+            continue;
+        }
+
+        (*p)++;
+        char esc = **p;
+        if (!esc) {
+            free(buf);
+            snprintf(err, err_len, "unfinished JSON string escape");
+            return false;
+        }
+        (*p)++;
+        switch (esc) {
+            case '"': append_byte(&buf, &n, &cap, '"'); break;
+            case '\\': append_byte(&buf, &n, &cap, '\\'); break;
+            case '/': append_byte(&buf, &n, &cap, '/'); break;
+            case 'b': append_byte(&buf, &n, &cap, '\b'); break;
+            case 'f': append_byte(&buf, &n, &cap, '\f'); break;
+            case 'n': append_byte(&buf, &n, &cap, '\n'); break;
+            case 'r': append_byte(&buf, &n, &cap, '\r'); break;
+            case 't': append_byte(&buf, &n, &cap, '\t'); break;
+            case 'u': {
+                uint32_t cp = hex4(*p, err, err_len);
+                if (cp == UINT32_MAX) {
+                    free(buf);
+                    return false;
+                }
+                *p += 4;
+                if (0xD800u <= cp && cp <= 0xDBFFu) {
+                    if ((*p)[0] != '\\' || (*p)[1] != 'u') {
+                        free(buf);
+                        snprintf(err, err_len, "missing low surrogate in JSON string");
+                        return false;
+                    }
+                    *p += 2;
+                    uint32_t lo = hex4(*p, err, err_len);
+                    if (lo == UINT32_MAX) {
+                        free(buf);
+                        return false;
+                    }
+                    *p += 4;
+                    if (lo < 0xDC00u || lo > 0xDFFFu) {
+                        free(buf);
+                        snprintf(err, err_len, "invalid low surrogate in JSON string");
+                        return false;
+                    }
+                    cp = 0x10000u + ((cp - 0xD800u) << 10) + (lo - 0xDC00u);
+                } else if (0xDC00u <= cp && cp <= 0xDFFFu) {
+                    free(buf);
+                    snprintf(err, err_len, "unexpected low surrogate in JSON string");
+                    return false;
+                }
+                append_utf8(&buf, &n, &cap, cp);
+            } break;
+            default:
+                free(buf);
+                snprintf(err, err_len, "unsupported JSON escape '\\%c'", esc);
+                return false;
+        }
+    }
+    if (**p != '"') {
+        free(buf);
+        snprintf(err, err_len, "unterminated JSON string");
+        return false;
+    }
+    (*p)++;
+    if (!buf) {
+        buf = ei_xmalloc(1);
+        buf[0] = '\0';
+    }
+    *out = (sv_string){ buf, n };
+    return true;
+}
+
+static bool append_input(string_list *list, sv_string s) {
+    list->items = ei_xrealloc(list->items, sizeof(sv_string) * (list->n + 1u));
+    list->structured = ei_xrealloc(list->structured, sizeof(bool) * (list->n + 1));
+    list->structured[list->n] = false;
+    list->items[list->n++] = s;
+    return true;
+}
+
+static void free_inputs(string_list *list) {
+    for (size_t i = 0; i < list->n; i++) free(list->items[i].s);
+    free(list->items);
+    free(list->structured);
+    memset(list, 0, sizeof *list);
+}
+
+static const char *find_json_field(const char *body, const char *name) {
+    char pattern[64];
+    int pattern_len = snprintf(pattern, sizeof pattern, "\"%s\"", name);
+    if (pattern_len < 0 || (size_t)pattern_len >= sizeof pattern) return NULL;
+
+    const char *p = body;
+    while ((p = strstr(p, pattern)) != NULL) {
+        const char *q = p + (size_t)pattern_len;
+        skip_ws(&q);
+        if (*q == ':') return q + 1;
+        p += (size_t)pattern_len;
+    }
+    return NULL;
+}
+
+static bool parse_input_item(const char **p, string_list *inputs, char *err, size_t len) {
+    skip_ws(p);
+    if (**p == '"') {
+        sv_string value;
+        if (!parse_json_string(p, &value, err, len)) return false;
+        return append_input(inputs, value);
+    }
+    if (**p != '{') {
+        snprintf(err, len, "input must contain strings or content objects");
+        return false;
+    }
+    const char *start = *p;
+    char stack[32];
+    size_t depth = 0;
+    do {
+        char c = **p;
+        if (!c) {
+            snprintf(err, len, "unterminated input object");
+            return false;
+        }
+        if (c == '"') {
+            sv_string temp;
+            if (!parse_json_string(p, &temp, err, len)) return false;
+            free(temp.s);
+            continue;
+        }
+        if (c == '{' || c == '[') {
+            if (depth == sizeof stack) {
+                snprintf(err, len, "input nesting too deep");
+                return false;
+            }
+            stack[depth++] = c;
+        } else if (c == '}' || c == ']') {
+            if (!depth || stack[depth - 1] != (c == '}' ? '{' : '[')) {
+                snprintf(err, len, "invalid input nesting");
+                return false;
+            }
+            --depth;
+        }
+        ++*p;
+    } while (depth);
+    size_t n = (size_t)(*p - start);
+    char *copy = ei_xmalloc(n + 1);
+    memcpy(copy, start, n);
+    copy[n] = 0;
+    append_input(inputs, (sv_string){copy, n});
+    inputs->structured[inputs->n - 1] = true;
+    return true;
+}
+
+static bool parse_embed_request(const char *body, string_list *inputs,
+                                int32_t *dimensions, embedding_encoding *encoding,
+                                char *err, size_t err_len) {
+    const char *p = find_json_field(body, "input");
+    if (!p) {
+        snprintf(err, err_len, "request JSON must contain an input field");
+        return false;
+    }
+    skip_ws(&p);
+    if (*p == '"' || *p == '{') {
+        if (!parse_input_item(&p, inputs, err, err_len)) return false;
+    } else {
+        if (*p != '[') {
+            snprintf(err, err_len, "input must be a string, content object, or array");
+            return false;
+        }
+        ++p;
+        for (;;) {
+            if (!parse_input_item(&p, inputs, err, err_len)) return false;
+            skip_ws(&p);
+            if (*p == ']') {
+                ++p;
+                break;
+            }
+            if (*p != ',') {
+                snprintf(err, err_len, "expected comma or closing bracket in input array");
+                return false;
+            }
+            ++p;
+        }
+    }
+
+    *dimensions = EI_N_EMBD;
+    p = find_json_field(body, "dimensions");
+    if (p) {
+        skip_ws(&p);
+        if (!isdigit((unsigned char)*p)) {
+            snprintf(err, err_len, "dimensions must be an integer");
+            return false;
+        }
+        char *end = NULL;
+        errno = 0;
+        unsigned long long parsed = strtoull(p, &end, 10);
+        if (errno || end == p) {
+            snprintf(err, err_len, "invalid dimensions value");
+            return false;
+        }
+        const char *after = end;
+        skip_ws(&after);
+        if (*after != ',' && *after != '}') {
+            snprintf(err, err_len, "dimensions must be an integer");
+            return false;
+        }
+        if (parsed > INT32_MAX ||
+            !ei_embedding_dimensions_supported((int32_t)parsed)) {
+            snprintf(err, err_len,
+                     "dimensions must be one of 128, 256, 512, or 768");
+            return false;
+        }
+        *dimensions = (int32_t)parsed;
+    }
+
+    *encoding = EMBEDDING_ENCODING_FLOAT;
+    p = find_json_field(body, "encoding_format");
+    if (p) {
+        sv_string format;
+        if (!parse_json_string(&p, &format, err, err_len)) {
+            snprintf(err, err_len, "encoding_format must be \"float\" or \"base64\"");
+            return false;
+        }
+        if (format.len == strlen("float") &&
+            memcmp(format.s, "float", format.len) == 0) {
+            *encoding = EMBEDDING_ENCODING_FLOAT;
+        } else if (format.len == strlen("base64") &&
+                   memcmp(format.s, "base64", format.len) == 0) {
+            *encoding = EMBEDDING_ENCODING_BASE64;
+        } else {
+            free(format.s);
+            snprintf(err, err_len, "encoding_format must be \"float\" or \"base64\"");
+            return false;
+        }
+        free(format.s);
+    }
+    return true;
+}
+
+static bool parse_required_model(const char *body, sv_string *model,
+                                 char *err, size_t err_len) {
+    const char *p = find_json_field(body, "model");
+    if (!p) {
+        snprintf(err, err_len, "request JSON must contain a model field");
+        return false;
+    }
+    if (!parse_json_string(&p, model, err, err_len)) {
+        snprintf(err, err_len, "model must be a string");
+        return false;
+    }
+    if (model->len == 0) {
+        free(model->s);
+        *model = (sv_string){0};
+        snprintf(err, err_len, "model must not be empty");
+        return false;
+    }
+    return true;
+}
+
+static void send_header_and_body(int fd, const char *hdr, size_t hdr_len,
+                                 const char *body, size_t body_len) {
+    struct iovec iov[2] = {
+        {(void *)(uintptr_t)hdr, hdr_len},
+        {(void *)(uintptr_t)body, body_len},
+    };
+    int index = 0;
+    while (index < 2) {
+        ssize_t sent = writev(fd, iov + index, 2 - index);
+        if (sent < 0) {
+            if (errno == EINTR) continue;
+            return;
+        }
+        size_t remaining = (size_t)sent;
+        while (index < 2 && remaining >= iov[index].iov_len) {
+            remaining -= iov[index].iov_len;
+            index++;
+        }
+        if (index < 2) {
+            iov[index].iov_base = (char *)iov[index].iov_base + remaining;
+            iov[index].iov_len -= remaining;
+        }
+    }
+}
+
+static void http_response_raw(int fd, int status, const char *reason,
+                              const char *content_type, const char *body,
+                              size_t body_len, bool keep_alive) {
+    char hdr[512];
+    int n = snprintf(hdr, sizeof hdr,
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: %s\r\n"
+        "\r\n",
+        status, reason, content_type, body_len,
+        keep_alive ? "keep-alive" : "close");
+    if (n <= 0) return;
+    send_header_and_body(fd, hdr, (size_t)n, body, body_len);
+}
+
+static void http_response_typed(int fd, int status, const char *reason,
+                                const char *content_type, const char *body,
+                                bool keep_alive) {
+    http_response_raw(fd, status, reason, content_type, body, strlen(body),
+                      keep_alive);
+}
+
+static void http_response(int fd, int status, const char *reason,
+                          const char *body, bool keep_alive) {
+    http_response_typed(fd, status, reason, "application/json; charset=utf-8",
+                        body, keep_alive);
+}
+
+static void http_error(int fd, int status, const char *reason, const char *msg,
+                       bool keep_alive) {
+    sbuf b = {0};
+    sbuf_append_z(&b, "{\"error\":");
+    sbuf_append_json_string(&b, msg, strlen(msg));
+    sbuf_append_z(&b, "}\n");
+    http_response(fd, status, reason,
+                  b.data ? b.data : "{\"error\":\"unknown\"}\n",
+                  keep_alive);
+    free(b.data);
+}
+
+static void openai_http_error(int fd, int status, const char *reason,
+                              const char *msg, const char *param,
+                              bool keep_alive) {
+    sbuf b = {0};
+    sbuf_append_z(&b, "{\"error\":{\"message\":");
+    sbuf_append_json_string(&b, msg, strlen(msg));
+    sbuf_append_z(&b, ",\"type\":\"");
+    sbuf_append_z(&b, status >= 500 ? "server_error" : "invalid_request_error");
+    sbuf_append_z(&b, "\",\"param\":");
+    if (param) sbuf_append_json_string(&b, param, strlen(param));
+    else sbuf_append_z(&b, "null");
+    sbuf_append_z(&b, ",\"code\":null}}\n");
+    http_response(fd, status, reason, b.data, keep_alive);
+    free(b.data);
+}
+
+static void embedding_http_error(int fd, embedding_api api, int status,
+                                 const char *reason, const char *msg,
+                                 const char *param, bool keep_alive) {
+    if (api == EMBEDDING_API_OPENAI) {
+        openai_http_error(fd, status, reason, msg, param, keep_alive);
+    } else {
+        http_error(fd, status, reason, msg, keep_alive);
+    }
+}
+
+static const char *embed_request_error_param(const char *message) {
+    if (strstr(message, "dimensions")) return "dimensions";
+    if (strstr(message, "encoding_format")) return "encoding_format";
+    return "input";
+}
+
+static bool ascii_equal_ci(const char *a, const char *b, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool header_value(const char *headers, const char *name, sv_string *value) {
+    size_t name_len = strlen(name);
+    const char *line = headers;
+    while (*line) {
+        const char *next = strstr(line, "\r\n");
+        const char *line_end = next ? next : line + strlen(line);
+        const char *colon = memchr(line, ':', (size_t)(line_end - line));
+        if (colon != NULL) {
+            size_t key_len = (size_t)(colon - line);
+            if (key_len == name_len && ascii_equal_ci(line, name, name_len)) {
+                const char *begin = colon + 1;
+                while (begin < line_end && isspace((unsigned char)*begin)) begin++;
+                while (line_end > begin &&
+                       isspace((unsigned char)line_end[-1])) line_end--;
+                *value = (sv_string){ (char *)begin, (size_t)(line_end - begin) };
+                return true;
+            }
+        }
+        if (!next) break;
+        line = next + 2;
+    }
+    return false;
+}
+
+static bool header_has_token(const char *headers, const char *name,
+                             const char *token) {
+    sv_string value;
+    if (!header_value(headers, name, &value)) return false;
+    const size_t token_len = strlen(token);
+    const char *p = value.s;
+    const char *end = value.s + value.len;
+    while (p < end) {
+        while (p < end && (isspace((unsigned char)*p) || *p == ',')) p++;
+        const char *item = p;
+        while (p < end && *p != ',') p++;
+        const char *item_end = p;
+        while (item_end > item && isspace((unsigned char)item_end[-1])) item_end--;
+        if ((size_t)(item_end - item) == token_len &&
+            ascii_equal_ci(item, token, token_len)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static char *find_header_end(char *buf, size_t n) {
+    if (n < 4) return NULL;
+    for (size_t i = 0; i + 3 < n; i++) {
+        if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+            return buf + i;
+        }
+    }
+    return NULL;
+}
+
+typedef struct {
+    int fd;
+    sbuf buffered;
+} http_connection;
+
+typedef enum {
+    HTTP_READ_OK,
+    HTTP_READ_CLOSED,
+    HTTP_READ_ERROR,
+} http_read_result;
+
+static http_read_result read_request(http_connection *connection,
+                                     char **headers_out, char **body_out,
+                                     size_t *body_len_out,
+                                     char *err, size_t err_len) {
+    char tmp[8192];
+    char *hdr_end = find_header_end(
+        connection->buffered.data, connection->buffered.n);
+    while (!hdr_end) {
+        ssize_t n = recv(connection->fd, tmp, sizeof tmp, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
+                connection->buffered.n == 0) {
+                return HTTP_READ_CLOSED;
+            }
+            snprintf(err, err_len, "failed to read request");
+            return HTTP_READ_ERROR;
+        }
+        if (n == 0) {
+            if (connection->buffered.n == 0) return HTTP_READ_CLOSED;
+            snprintf(err, err_len,
+                     "client closed connection before headers completed");
+            return HTTP_READ_ERROR;
+        }
+        sbuf_append(&connection->buffered, tmp, (size_t)n);
+        hdr_end = find_header_end(
+            connection->buffered.data, connection->buffered.n);
+        if (!hdr_end && connection->buffered.n > MAX_HEADER_BYTES) {
+            snprintf(err, err_len, "request headers are too large");
+            return HTTP_READ_ERROR;
+        }
+    }
+
+    size_t header_len = (size_t)(hdr_end - connection->buffered.data);
+    size_t body_start = header_len + 4u;
+    char *headers = ei_xmalloc(header_len + 1u);
+    memcpy(headers, connection->buffered.data, header_len);
+    headers[header_len] = '\0';
+
+    size_t body_len = 0;
+    sv_string content_length;
+    if (header_value(headers, "content-length", &content_length)) {
+        if (content_length.len == 0) {
+            snprintf(err, err_len, "invalid Content-Length");
+            free(headers);
+            return HTTP_READ_ERROR;
+        }
+        for (size_t i = 0; i < content_length.len; i++) {
+            unsigned char c = (unsigned char)content_length.s[i];
+            if (!isdigit(c) || body_len > (MAX_BODY_BYTES - (size_t)(c - '0')) / 10u) {
+                snprintf(err, err_len, "invalid Content-Length");
+                free(headers);
+                return HTTP_READ_ERROR;
+            }
+            body_len = body_len * 10u + (size_t)(c - '0');
+        }
+    }
+    sv_string transfer_encoding;
+    if (header_value(headers, "transfer-encoding", &transfer_encoding)) {
+        (void)transfer_encoding;
+        snprintf(err, err_len, "Transfer-Encoding is not supported");
+        free(headers);
+        return HTTP_READ_ERROR;
+    }
+
+    while (connection->buffered.n - body_start < body_len) {
+        ssize_t n = recv(connection->fd, tmp, sizeof tmp, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            snprintf(err, err_len, "failed to read request body");
+            free(headers);
+            return HTTP_READ_ERROR;
+        }
+        if (n == 0) {
+            snprintf(err, err_len, "client closed connection before body completed");
+            free(headers);
+            return HTTP_READ_ERROR;
+        }
+        sbuf_append(&connection->buffered, tmp, (size_t)n);
+    }
+
+    char *body = ei_xmalloc(body_len + 1u);
+    memcpy(body, connection->buffered.data + body_start, body_len);
+    body[body_len] = '\0';
+    size_t consumed = body_start + body_len;
+    size_t remaining = connection->buffered.n - consumed;
+    memmove(connection->buffered.data,
+            connection->buffered.data + consumed, remaining);
+    connection->buffered.n = remaining;
+    connection->buffered.data[remaining] = '\0';
+
+    *headers_out = headers;
+    *body_out = body;
+    *body_len_out = body_len;
+    return HTTP_READ_OK;
+}
+
+static void handle_tags(int fd, const server_opts *opts, bool keep_alive) {
+    (void)opts;
+    sbuf b = {0};
+    sbuf_append_z(&b, "{\"models\":[{\"name\":");
+    sbuf_append_json_string(&b, opts->profile->name, strlen(opts->profile->name));
+    sbuf_append_z(&b, "}]}");
+    http_response(fd, 200, "OK", b.data, keep_alive);
+    free(b.data);
+}
+
+// Media cache (embeddinggemma-2 content objects): tower outputs by content
+// hash and whole-input embeddings, shared by every media slot. NULL when off.
+static ei_response_cache *media_cache;
+#include "http_media.h"
+
+static void handle_embed(int fd, ei_inference_service *service,
+                         const server_opts *opts, const char *body,
+                         size_t body_len, bool keep_alive,
+                         ei_response_cache *response_cache,
+                         embedding_api api) {
+    char err[256];
+    string_list inputs = {0};
+    sv_string model = {0};
+    int32_t dimensions;
+    embedding_encoding encoding;
+    if (api == EMBEDDING_API_OPENAI &&
+        !parse_required_model(body, &model, err, sizeof err)) {
+        openai_http_error(fd, 400, "Bad Request", err, "model", keep_alive);
+        return;
+    }
+    if (!parse_embed_request(body, &inputs, &dimensions, &encoding,
+                             err, sizeof err)) {
+        free_inputs(&inputs);
+        free(model.s);
+        embedding_http_error(fd, api, 400, "Bad Request", err,
+                             embed_request_error_param(err), keep_alive);
+        return;
+    }
+    if (inputs.n > opts->max_client_batch_size) {
+        snprintf(err, sizeof err, "batch size %zu exceeds maximum %zu",
+                 inputs.n, opts->max_client_batch_size);
+        free_inputs(&inputs);
+        free(model.s);
+        embedding_http_error(fd, api, 400, "Bad Request", err, "input",
+                             keep_alive);
+        return;
+    }
+
+    const char *cache_key = body;
+    size_t cache_key_len = body_len;
+    char *owned_cache_key = NULL;
+    if (api == EMBEDDING_API_OPENAI) {
+        owned_cache_key = ei_xmalloc(body_len + 1u);
+        owned_cache_key[0] = '\1';
+        memcpy(owned_cache_key + 1u, body, body_len);
+        cache_key = owned_cache_key;
+        cache_key_len++;
+    }
+    if (encoding == EMBEDDING_ENCODING_FLOAT) {
+        ei_response_cache_value cached;
+        if (ei_response_cache_acquire(
+                response_cache, cache_key, cache_key_len, &cached)) {
+            http_response_raw(fd, 200, "OK",
+                              "application/json; charset=utf-8",
+                              cached.data, cached.len, keep_alive);
+            ei_response_cache_release(response_cache, &cached);
+            free(owned_cache_key);
+            free_inputs(&inputs);
+            free(model.s);
+            return;
+        }
+    }
+
+    const char **texts = ei_xmalloc(inputs.n * sizeof(*texts));
+    size_t *lengths = ei_xmalloc(inputs.n * sizeof(*lengths));
+    float *embeddings = ei_xmalloc(inputs.n * EI_N_EMBD * sizeof(*embeddings));
+    for (size_t i = 0; i < inputs.n; i++) {
+        texts[i] = inputs.items[i].s;
+        lengths[i] = inputs.items[i].len;
+    }
+    size_t prompt_tokens = 0;
+    bool any_structured = false;
+    for (size_t i = 0; i < inputs.n; ++i)
+        any_structured |= inputs.structured[i];
+    bool embedded = true;
+    if (any_structured) {
+        for (size_t i = 0; i < inputs.n && embedded; ++i) {
+            size_t count = 0;
+            if (inputs.structured[i]) {
+                embedded = embed_structured(opts, &inputs.items[i], embeddings + i * EI_N_EMBD,
+                                            &count, err, sizeof err);
+            } else
+                embedded = ei_inference_service_embed_batch_with_usage(
+                    service, texts + i, lengths + i, 1, embeddings + i * EI_N_EMBD, &count, err,
+                    sizeof err);
+            prompt_tokens += count;
+        }
+    } else
+        embedded = ei_inference_service_embed_batch_with_usage(
+            service, texts, lengths, inputs.n, embeddings, &prompt_tokens, err, sizeof err);
+    if (!embedded) {
+        free(embeddings);
+        free(lengths);
+        free(texts);
+        free(owned_cache_key);
+        free_inputs(&inputs);
+        free(model.s);
+        embedding_http_error(fd, api, 400, "Bad Request", err, "input",
+                             keep_alive);
+        return;
+    }
+
+    sbuf out = {0};
+    sbuf_reserve(&out, inputs.n * ((size_t)dimensions * 16u + 3u) + 32u);
+    sbuf_append_z(&out, api == EMBEDDING_API_OPENAI
+        ? "{\"object\":\"list\",\"data\":["
+        : "{\"embeddings\":[");
+    for (size_t i = 0; i < inputs.n; i++) {
+        float *emb = embeddings + i * EI_N_EMBD;
+        if (!ei_embedding_normalize_prefix(emb, dimensions)) {
+            free_inputs(&inputs);
+            free(model.s);
+            free(owned_cache_key);
+            free(embeddings);
+            free(lengths);
+            free(texts);
+            free(out.data);
+            embedding_http_error(fd, api, 500, "Internal Server Error",
+                                 "unsupported embedding dimensions",
+                                 "dimensions", keep_alive);
+            return;
+        }
+        if (i) sbuf_append_z(&out, ",");
+        if (api == EMBEDDING_API_OPENAI) {
+            sbuf_append_z(&out,
+                          "{\"object\":\"embedding\",\"embedding\":");
+        }
+        if (encoding == EMBEDDING_ENCODING_BASE64) {
+            sbuf_append_z(&out, "\"");
+            sbuf_append_base64_f32(&out, emb, (size_t)dimensions);
+            sbuf_append_z(&out, "\"");
+        } else {
+            sbuf_append_z(&out, "[");
+            for (int32_t d = 0; d < dimensions; d++) {
+                if (d) sbuf_append(&out, ",", 1);
+                sbuf_reserve(&out, EI_F32_TO_CHARS_CAPACITY);
+                const size_t n = ei_f32_to_chars(out.data + out.n, emb[d]);
+                if (n == 0) {
+                    free_inputs(&inputs);
+                    free(model.s);
+                    free(owned_cache_key);
+                    free(embeddings);
+                    free(lengths);
+                    free(texts);
+                    free(out.data);
+                    embedding_http_error(fd, api, 500,
+                                         "Internal Server Error",
+                                         "failed to format embedding", NULL,
+                                         keep_alive);
+                    return;
+                }
+                out.n += n;
+                out.data[out.n] = '\0';
+            }
+            sbuf_append_z(&out, "]");
+        }
+        if (api == EMBEDDING_API_OPENAI) {
+            char index[64];
+            snprintf(index, sizeof index, ",\"index\":%zu}", i);
+            sbuf_append_z(&out, index);
+        }
+    }
+    if (api == EMBEDDING_API_OPENAI) {
+        sbuf_append_z(&out, "],\"model\":");
+        sbuf_append_json_string(&out, model.s, model.len);
+        char usage[160];
+        snprintf(usage, sizeof usage,
+                 ",\"usage\":{\"prompt_tokens\":%zu,\"total_tokens\":%zu}}",
+                 prompt_tokens, prompt_tokens);
+        sbuf_append_z(&out, usage);
+    } else {
+        sbuf_append_z(&out, "]}");
+    }
+    if (encoding == EMBEDDING_ENCODING_FLOAT) {
+        ei_response_cache_insert(
+            response_cache, cache_key, cache_key_len, out.data, out.n);
+    }
+    http_response_raw(fd, 200, "OK", "application/json; charset=utf-8",
+                      out.data, out.n, keep_alive);
+    free(out.data);
+    free(embeddings);
+    free(lengths);
+    free(texts);
+    free(owned_cache_key);
+    free_inputs(&inputs);
+    free(model.s);
+}
+
+static bool request_keep_alive(const char *headers, const char *version) {
+    if (strcmp(version, "HTTP/1.1") == 0) {
+        return !header_has_token(headers, "connection", "close");
+    }
+    if (strcmp(version, "HTTP/1.0") == 0) {
+        return header_has_token(headers, "connection", "keep-alive");
+    }
+    return false;
+}
+
+static bool handle_client(http_connection *connection,
+                          ei_inference_service *service,
+                          const server_opts *opts,
+                          ei_response_cache *response_cache,
+                          bool allow_keep_alive) {
+    char err[256];
+    char *headers = NULL;
+    char *body = NULL;
+    size_t body_len = 0;
+    http_read_result read_result = read_request(
+        connection, &headers, &body, &body_len, err, sizeof err);
+    if (read_result != HTTP_READ_OK) {
+        if (read_result == HTTP_READ_ERROR) {
+            http_error(connection->fd, 400, "Bad Request", err, false);
+        }
+        return false;
+    }
+    (void)body_len;
+
+    char method[16] = {0};
+    char path[256] = {0};
+    char version[16] = {0};
+    bool parsed = sscanf(headers, "%15s %255s %15s", method, path, version) == 3;
+    bool keep_alive = parsed && allow_keep_alive &&
+        request_keep_alive(headers, version);
+    if (!parsed) {
+        http_error(connection->fd, 400, "Bad Request",
+                   "malformed request line", false);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0) {
+        http_response(connection->fd, 200, "OK", EI_ROOT_JSON, keep_alive);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/healthz") == 0) {
+        http_response(connection->fd, 200, "OK", EI_HEALTH_JSON, keep_alive);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/docs") == 0) {
+        http_response_typed(connection->fd, 200, "OK",
+                            "text/html; charset=utf-8", EI_DOCS_HTML,
+                            keep_alive);
+    } else if (strcmp(method, "GET") == 0 &&
+               strcmp(path, "/openapi.json") == 0) {
+        http_response(connection->fd, 200, "OK", EI_OPENAPI_JSON, keep_alive);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/tags") == 0) {
+        handle_tags(connection->fd, opts, keep_alive);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/embed") == 0) {
+        handle_embed(connection->fd, service, opts, body, body_len,
+                     keep_alive, response_cache, EMBEDDING_API_NATIVE);
+    } else if (strcmp(method, "POST") == 0 &&
+               strcmp(path, "/v1/embeddings") == 0) {
+        handle_embed(connection->fd, service, opts, body, body_len,
+                     keep_alive, response_cache, EMBEDDING_API_OPENAI);
+    } else {
+        http_error(connection->fd, 404, "Not Found",
+                   "route not found; see GET /docs or GET /openapi.json",
+                   keep_alive);
+    }
+
+    free(headers);
+    free(body);
+    return keep_alive;
+}
+
+static char *dup_range(const char *s, size_t n) {
+    char *out = ei_xmalloc(n + 1u);
+    memcpy(out, s, n);
+    out[n] = '\0';
+    return out;
+}
+
+static char *dup_z(const char *s) {
+    return dup_range(s, strlen(s));
+}
+
+static char *path_join(const char *a, const char *b) {
+    size_t an = strlen(a);
+    size_t bn = strlen(b);
+    bool slash = an > 0 && a[an - 1] == '/';
+    char *out = ei_xmalloc(an + (slash ? 0u : 1u) + bn + 1u);
+    memcpy(out, a, an);
+    size_t n = an;
+    if (!slash) out[n++] = '/';
+    memcpy(out + n, b, bn);
+    out[n + bn] = '\0';
+    return out;
+}
+
+static char *dirname_copy(const char *path) {
+    const char *slash = strrchr(path, '/');
+    if (!slash) return dup_z(".");
+    if (slash == path) return dup_z("/");
+    return dup_range(path, (size_t)(slash - path));
+}
+
+static char *resolve_model_path(const server_opts *opts) {
+    if (opts->model_path) return dup_z(opts->model_path);
+    const char *override = getenv("EI_MODEL_PATH");
+    if (override && *override) return dup_z(override);
+
+    const char *cache_home = getenv("XDG_CACHE_HOME");
+    char *root = NULL;
+    if (cache_home && *cache_home) {
+        root = dup_z(cache_home);
+    } else {
+        const char *home = getenv("HOME");
+        root = path_join(home && *home ? home : ".", ".cache");
+    }
+    char *directory = path_join(root, "embeddinggemma.c");
+    char *model = path_join(directory, opts->profile->file);
+    free(directory);
+    free(root);
+    return model;
+}
+
+static bool regular_file_exists(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        if (!S_ISREG(st.st_mode)) ei_die("%s exists but is not a regular file", path);
+        return true;
+    }
+    if (errno == ENOENT) return false;
+    ei_die("cannot stat %s: %s", path, strerror(errno));
+}
+
+static void ensure_dir(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) ei_die("%s exists but is not a directory", path);
+        return;
+    }
+    if (errno != ENOENT) ei_die("cannot stat %s: %s", path, strerror(errno));
+    if (mkdir(path, 0755) != 0 && errno != EEXIST) {
+        ei_die("cannot create directory %s: %s", path, strerror(errno));
+    }
+}
+
+static void mkdir_p(const char *path) {
+    char *tmp = dup_z(path);
+    size_t n = strlen(tmp);
+    if (n == 0) {
+        free(tmp);
+        return;
+    }
+    for (size_t i = 1; i < n; i++) {
+        if (tmp[i] == '/') {
+            tmp[i] = '\0';
+            ensure_dir(tmp);
+            tmp[i] = '/';
+        }
+    }
+    ensure_dir(tmp);
+    free(tmp);
+}
+
+typedef enum {
+    DOWNLOADER_UNAVAILABLE,
+    DOWNLOADER_FAILED,
+    DOWNLOADER_SUCCEEDED,
+} downloader_result;
+
+static downloader_result run_downloader(const char *program,
+                                        char *const arguments[]) {
+    pid_t child;
+    int rc = posix_spawnp(&child, program, NULL, NULL, arguments, environ);
+    if (rc == ENOENT) return DOWNLOADER_UNAVAILABLE;
+    if (rc != 0) {
+        fprintf(stderr, "cannot start %s: %s\n", program, strerror(rc));
+        return DOWNLOADER_FAILED;
+    }
+
+    int status;
+    do {
+        rc = waitpid(child, &status, 0);
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 0) {
+        fprintf(stderr, "cannot wait for %s: %s\n", program, strerror(errno));
+        return DOWNLOADER_FAILED;
+    }
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        return DOWNLOADER_SUCCEEDED;
+    }
+    if (WIFEXITED(status)) {
+        fprintf(stderr, "%s exited with status %d\n",
+                program, WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        fprintf(stderr, "%s terminated by signal %d\n",
+                program, WTERMSIG(status));
+    }
+    return DOWNLOADER_FAILED;
+}
+
+static void download_model(const char *model_path, const char *url) {
+    char *model_dir = dirname_copy(model_path);
+    mkdir_p(model_dir);
+    free(model_dir);
+
+    size_t tmp_len = strlen(model_path) + strlen(".download.XXXXXX") + 1u;
+    char *tmp_path = ei_xmalloc(tmp_len);
+    snprintf(tmp_path, tmp_len, "%s.download.XXXXXX", model_path);
+
+    int tmp_fd = mkstemp(tmp_path);
+    if (tmp_fd < 0) {
+        free(tmp_path);
+        ei_die("cannot create temporary download file: %s", strerror(errno));
+    }
+    if (close(tmp_fd) != 0) {
+        unlink(tmp_path);
+        free(tmp_path);
+        ei_die("cannot close temporary download file: %s", strerror(errno));
+    }
+
+    fprintf(stderr, "model missing; downloading %s\n", url);
+    fprintf(stderr, "destination: %s\n", model_path);
+
+    char *curl_arguments[] = {
+        "curl",
+        "-fL",
+        "--retry",
+        "3",
+        "--retry-delay",
+        "1",
+        "--connect-timeout",
+        "30",
+        "--progress-bar",
+        "--user-agent",
+        "embeddinggemma.c/1.0",
+        "-o",
+        tmp_path,
+        (char *)url,
+        NULL,
+    };
+    downloader_result curl_result =
+        run_downloader("curl", curl_arguments);
+
+    downloader_result wget_result = DOWNLOADER_UNAVAILABLE;
+    if (curl_result != DOWNLOADER_SUCCEEDED) {
+        char *wget_arguments[] = {
+            "wget", "--tries=3", "--timeout=30", "-O", tmp_path, (char *)url, NULL,
+        };
+        wget_result = run_downloader("wget", wget_arguments);
+    }
+
+    if (curl_result != DOWNLOADER_SUCCEEDED &&
+        wget_result != DOWNLOADER_SUCCEEDED) {
+        unlink(tmp_path);
+        free(tmp_path);
+        if (curl_result == DOWNLOADER_UNAVAILABLE &&
+            wget_result == DOWNLOADER_UNAVAILABLE) {
+            ei_die("model is missing and neither curl nor wget is available; "
+                   "install one or provide --model PATH");
+        }
+        ei_die("model download failed; provide --model PATH to use an existing file");
+    }
+
+    if (regular_file_exists(model_path)) {
+        fprintf(stderr, "model appeared during download; keeping existing file\n");
+        unlink(tmp_path);
+        free(tmp_path);
+        return;
+    }
+    if (rename(tmp_path, model_path) != 0) {
+        unlink(tmp_path);
+        free(tmp_path);
+        ei_die("cannot move downloaded model into place: %s", strerror(errno));
+    }
+    free(tmp_path);
+}
+
+static void ensure_model_available(const char *model_path, const char *url) {
+    if (regular_file_exists(model_path)) return;
+    download_model(model_path, url);
+}
+
+/* Fingerprint the model so a persisted cache is only reused with the exact
+ * same model file. Hashes the file size and first 64 KiB (GGUF header +
+ * metadata + first tensors) — cheap and reliably distinguishes models without
+ * reading the whole 278 MB file. */
+static uint64_t model_fingerprint(const char *path) {
+    uint64_t hash = 1469598103934665603ull;
+    FILE *file = fopen(path, "rb");
+    if (!file) return 0;
+    unsigned char buffer[65536];
+    if (fseek(file, 0, SEEK_END) == 0) {
+        long size = ftell(file);
+        for (int i = 0; i < 8; i++) {
+            hash ^= (uint64_t)((size >> (i * 8)) & 0xff);
+            hash *= 1099511628211ull;
+        }
+        rewind(file);
+    }
+    size_t got = fread(buffer, 1, sizeof buffer, file);
+    for (size_t i = 0; i < got; i++) {
+        hash ^= buffer[i];
+        hash *= 1099511628211ull;
+    }
+    fclose(file);
+    return hash;
+}
+
+static volatile sig_atomic_t g_stop_requested = 0;
+static void handle_stop_signal(int sig) {
+    (void)sig;
+    g_stop_requested = 1;
+}
+
+static void usage(const char *argv0) {
+    fprintf(stderr,
+            "usage: %s [--bind ADDR] [--port PORT] [--backend auto|cpu|kfd|metal|cuda|rocm|xpu]\n"
+            "          [--profile embeddinggemma-2|embeddinggemma-300m]\n"
+            "          [--model PATH] [--mmproj PATH] [--text-only] [--workers N] [--max-queue N]\n"
+            "          [--cache-entries N] [--max-batch-tokens N]\n"
+            "          [--max-batch-requests N]\n"
+            "          [--max-batch-sequence-tokens N]\n"
+            "          [--max-client-batch-size N] [--tokenizer-workers N]\n"
+            "          [--batch-wait-us N] [--keepalive-connections N]\n"
+            "          [--keepalive-max-requests N] [--keepalive-timeout-ms N]\n"
+            "          [--response-cache-mb N] [--persistent-cache-path PATH]\n"
+            "          [--pipeline-slots N]  (embeddinggemma-2 GPU waves in flight, 1..8)\n"
+            "          [--media-slots N]  (embeddinggemma-2 GPU media contexts in flight, 1..8; default 2)\n"
+            "          [--media-cache-mb N]  (embeddinggemma-2 cache of image/audio tower outputs and\n"
+            "                                 content-object embeddings; 0 disables; default 256)\n"
+            "          [--short-bypass-tokens N]  (short requests bypass long waves; implies 2 slots)\n"
+            "          [--threads N]  (CPU inference threads; split across --cpu-workers)\n"
+            "          [--cpu-workers N]  (independent CPU executors; beside a GPU they take overflow)\n"
+            "          [--cpu-max-batch-tokens N]  (CPU-worker wave size, default 1024)\n"
+            "          [--cpu-max-sequence-tokens N]  (largest request a CPU worker beside a GPU takes)\n"
+            "          [--cpu-pin on|off]  (pin CPU-worker threads to cores, Linux; default on)\n"
+            "          [--cuda-devices all|I,J,...]  (embeddinggemma-2 on several GPUs)\n"
+            "default listen: 0.0.0.0:%d\n"
+            "default model: $XDG_CACHE_HOME/embeddinggemma.c/%s\n"
+            "               or $HOME/.cache/embeddinggemma.c/%s\n",
+            argv0, EMBEDDINGGEMMA_DEFAULT_PORT, ei_profiles[0].file, ei_profiles[0].file);
+}
+
+static bool parse_size_arg(const char *value, size_t minimum, size_t maximum,
+                           size_t *out) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (errno || end == value || *end != '\0' || parsed < minimum ||
+        parsed > maximum) return false;
+    *out = (size_t)parsed;
+    return true;
+}
+
+static bool parse_args(int argc, char **argv, server_opts *opts) {
+    bool keepalive_connections_set = false;
+    opts->bind_host = "0.0.0.0";
+    opts->port = EMBEDDINGGEMMA_DEFAULT_PORT;
+    opts->backend = DEFAULT_INFERENCE_BACKEND;
+    opts->model_path = NULL;
+    opts->text_only = false;
+    opts->projector_path = NULL;
+    opts->profile = &ei_profiles[0];
+    opts->engine = NULL;
+    opts->projector = NULL;
+    opts->profile_explicit = false;
+    opts->batch_tokens_explicit = false;
+    opts->workers_explicit = false;
+    opts->workers = 64;
+    opts->max_queue = 256;
+    opts->cache_entries = 4096;
+    opts->max_batch_tokens = 8192;
+    opts->max_batch_requests = 64;
+    opts->max_batch_sequence_tokens = 1024;
+    opts->pipeline_slots = 1;
+    opts->media_slots = 2;
+    opts->media_cache_bytes = 256u * 1024u * 1024u;
+    opts->threads = 0;
+    opts->cpu_workers = 0;
+    opts->cpu_max_batch_tokens = 1024;
+    opts->cpu_max_sequence_tokens = 512;
+    opts->cpu_pin = true;
+    opts->cuda_device_count = 0;
+    opts->cuda_all_devices = false;
+    opts->max_client_batch_size = 32;
+    opts->tokenizer_workers = 8;
+    opts->batch_wait_us = 200;
+    opts->keepalive_connections = 0;
+    opts->keepalive_max_requests = 100;
+    opts->keepalive_timeout_ms = 1000;
+    opts->response_cache_bytes = 64u * 1024u * 1024u;
+    opts->persistent_cache_path = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
+            opts->bind_host = argv[++i];
+        } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            opts->port = atoi(argv[++i]);
+            if (opts->port <= 0 || opts->port > 65535) return false;
+        } else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
+            opts->backend = argv[++i];
+            if (strcmp(opts->backend, "auto") != 0 && strcmp(opts->backend, "cpu") != 0 &&
+                strcmp(opts->backend, "kfd") != 0 &&
+                strcmp(opts->backend, "metal") != 0 &&
+                strcmp(opts->backend, "cuda") != 0 &&
+                strcmp(opts->backend, "rocm") != 0 &&
+                strcmp(opts->backend, "hip") != 0 &&
+                strcmp(opts->backend, "xpu") != 0 &&
+                strcmp(opts->backend, "sycl") != 0) return false;
+        } else if (strcmp(argv[i], "--profile") == 0 && i + 1 < argc) {
+            opts->profile = ei_profile_find(argv[++i]);
+            opts->profile_explicit = true;
+            if (!opts->profile) return false;
+        } else if (strcmp(argv[i], "--text-only") == 0) {
+            opts->text_only = true;
+        } else if (strcmp(argv[i], "--mmproj") == 0 && i + 1 < argc) {
+            opts->projector_path = argv[++i];
+        } else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
+            opts->model_path = argv[++i];
+        } else if (strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 1, 1024, &opts->workers)) return false;
+            opts->workers_explicit = true;
+        } else if (strcmp(argv[i], "--max-queue") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 1, 4096, &opts->max_queue)) return false;
+        } else if (strcmp(argv[i], "--cache-entries") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 0, 1048576, &opts->cache_entries)) return false;
+        } else if (strcmp(argv[i], "--max-batch-tokens") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], EI_N_CTX, 65536,
+                                &opts->max_batch_tokens)) return false;
+            opts->batch_tokens_explicit = true;
+        } else if (strcmp(argv[i], "--max-batch-requests") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 1, 256,
+                                &opts->max_batch_requests)) return false;
+        } else if (strcmp(argv[i], "--short-bypass-tokens") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 0, 8192, &opts->short_bypass_tokens)) return false;
+        } else if (strcmp(argv[i], "--media-cache-mb") == 0 && i + 1 < argc) {
+            size_t value = 0;
+            if (!parse_size_arg(argv[++i], 0, 65536, &value)) return false;
+            opts->media_cache_bytes = value * 1024u * 1024u;
+        } else if (strcmp(argv[i], "--media-slots") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 1, EI_MAX_MEDIA_SLOTS, &opts->media_slots)) return false;
+        } else if (strcmp(argv[i], "--pipeline-slots") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 1, EI_MAX_PIPELINE_SLOTS, &opts->pipeline_slots))
+                return false;
+        } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 1, 1024, &opts->threads)) return false;
+        } else if (strcmp(argv[i], "--cpu-workers") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 0, 16, &opts->cpu_workers)) return false;
+        } else if (strcmp(argv[i], "--cpu-pin") == 0 && i + 1 < argc) {
+            const char *value = argv[++i];
+            if (strcmp(value, "on") && strcmp(value, "off")) return false;
+            opts->cpu_pin = !strcmp(value, "on");
+        } else if (strcmp(argv[i], "--cpu-max-batch-tokens") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 1, 8192, &opts->cpu_max_batch_tokens)) return false;
+        } else if (strcmp(argv[i], "--cpu-max-sequence-tokens") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 1, 8192, &opts->cpu_max_sequence_tokens)) return false;
+        } else if (strcmp(argv[i], "--cuda-devices") == 0 && i + 1 < argc) {
+            const char *list = argv[++i];
+            if (!strcmp(list, "all")) {
+                opts->cuda_all_devices = true;
+            } else {
+                for (const char *at = list; *at;) {
+                    char *end = NULL;
+                    long device = strtol(at, &end, 10);
+                    if (end == at || device < 0 || device > 255 ||
+                        opts->cuda_device_count == EI_MAX_EXECUTORS || (*end && *end != ','))
+                        return false;
+                    opts->cuda_devices[opts->cuda_device_count++] = (int)device;
+                    at = *end ? end + 1 : end;
+                }
+                if (!opts->cuda_device_count) return false;
+            }
+        } else if (strcmp(argv[i], "--max-batch-sequence-tokens") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 1, 8192, &opts->max_batch_sequence_tokens)) return false;
+        } else if (strcmp(argv[i], "--max-client-batch-size") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 1, 256,
+                                &opts->max_client_batch_size)) return false;
+        } else if (strcmp(argv[i], "--tokenizer-workers") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 0, 64,
+                                &opts->tokenizer_workers)) return false;
+        } else if (strcmp(argv[i], "--batch-wait-us") == 0 && i + 1 < argc) {
+            size_t value;
+            if (!parse_size_arg(argv[++i], 0, 1000000, &value)) return false;
+            opts->batch_wait_us = (uint32_t)value;
+        } else if (strcmp(argv[i], "--keepalive-connections") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 0, 255,
+                                &opts->keepalive_connections)) return false;
+            keepalive_connections_set = true;
+        } else if (strcmp(argv[i], "--keepalive-max-requests") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], 1, 1000000,
+                                &opts->keepalive_max_requests)) return false;
+        } else if (strcmp(argv[i], "--keepalive-timeout-ms") == 0 && i + 1 < argc) {
+            size_t value;
+            if (!parse_size_arg(argv[++i], 1, 60000, &value)) return false;
+            opts->keepalive_timeout_ms = (uint32_t)value;
+        } else if (strcmp(argv[i], "--response-cache-mb") == 0 && i + 1 < argc) {
+            size_t value;
+            if (!parse_size_arg(argv[++i], 0, 4096, &value)) return false;
+            opts->response_cache_bytes = value * 1024u * 1024u;
+        } else if (strcmp(argv[i], "--persistent-cache-path") == 0 && i + 1 < argc) {
+            opts->persistent_cache_path = argv[++i];
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            usage(argv[0]);
+            exit(0);
+        } else {
+            return false;
+        }
+    }
+    opts->keepalive_explicit = keepalive_connections_set;
+    if (!keepalive_connections_set) {
+        opts->keepalive_connections = opts->workers / 2u;
+    }
+    if (opts->keepalive_connections >= opts->workers) return false;
+    const char *keepalive = getenv("EI_HTTP_KEEPALIVE");
+    if (keepalive && strcmp(keepalive, "0") == 0) {
+        opts->keepalive_connections = 0;
+    }
+    return true;
+}
+
+typedef struct {
+    int *fds;
+    size_t capacity;
+    size_t head;
+    size_t count;
+    pthread_mutex_t mutex;
+    pthread_cond_t ready;
+} socket_queue;
+
+typedef struct {
+    size_t active;
+    size_t capacity;
+    pthread_mutex_t mutex;
+} keepalive_limiter;
+
+typedef struct {
+    socket_queue *queue;
+    keepalive_limiter *keepalive;
+    ei_inference_service *service;
+    ei_response_cache *response_cache;
+    const server_opts *opts;
+} server_worker;
+
+static void socket_queue_init(socket_queue *queue, size_t capacity) {
+    memset(queue, 0, sizeof(*queue));
+    queue->fds = ei_xmalloc(capacity * sizeof(*queue->fds));
+    queue->capacity = capacity;
+    if (pthread_mutex_init(&queue->mutex, NULL) != 0 ||
+        pthread_cond_init(&queue->ready, NULL) != 0) {
+        ei_die("failed to initialize HTTP connection queue");
+    }
+}
+
+static bool socket_queue_try_push(socket_queue *queue, int fd) {
+    pthread_mutex_lock(&queue->mutex);
+    if (queue->count == queue->capacity) {
+        pthread_mutex_unlock(&queue->mutex);
+        return false;
+    }
+    size_t tail = (queue->head + queue->count) % queue->capacity;
+    queue->fds[tail] = fd;
+    queue->count++;
+    pthread_cond_signal(&queue->ready);
+    pthread_mutex_unlock(&queue->mutex);
+    return true;
+}
+
+static int socket_queue_pop(socket_queue *queue) {
+    pthread_mutex_lock(&queue->mutex);
+    while (queue->count == 0) pthread_cond_wait(&queue->ready, &queue->mutex);
+    int fd = queue->fds[queue->head];
+    queue->head = (queue->head + 1) % queue->capacity;
+    queue->count--;
+    pthread_mutex_unlock(&queue->mutex);
+    return fd;
+}
+
+static void keepalive_limiter_init(keepalive_limiter *limiter, size_t capacity) {
+    *limiter = (keepalive_limiter){ .capacity = capacity };
+    if (pthread_mutex_init(&limiter->mutex, NULL) != 0) {
+        ei_die("failed to initialize HTTP keep-alive limiter");
+    }
+}
+
+static bool keepalive_limiter_try_acquire(keepalive_limiter *limiter) {
+    pthread_mutex_lock(&limiter->mutex);
+    bool acquired = limiter->active < limiter->capacity;
+    if (acquired) limiter->active++;
+    pthread_mutex_unlock(&limiter->mutex);
+    return acquired;
+}
+
+static void keepalive_limiter_release(keepalive_limiter *limiter) {
+    pthread_mutex_lock(&limiter->mutex);
+    limiter->active--;
+    pthread_mutex_unlock(&limiter->mutex);
+}
+
+static void *server_worker_main(void *opaque) {
+    server_worker *worker = opaque;
+    for (;;) {
+        int fd = socket_queue_pop(worker->queue);
+        http_connection connection = { .fd = fd };
+        struct timeval receive_timeout = {
+            .tv_sec = worker->opts->keepalive_timeout_ms / 1000u,
+            .tv_usec = (suseconds_t)(
+                worker->opts->keepalive_timeout_ms % 1000u) * 1000,
+        };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
+                   sizeof receive_timeout);
+        bool keepalive_slot = worker->opts->keepalive_max_requests > 1 &&
+            keepalive_limiter_try_acquire(worker->keepalive);
+        for (size_t request = 0;; request++) {
+            bool allow_keep_alive = keepalive_slot &&
+                request + 1u < worker->opts->keepalive_max_requests;
+            if (!handle_client(&connection, worker->service, worker->opts,
+                               worker->response_cache, allow_keep_alive)) {
+                break;
+            }
+        }
+        if (keepalive_slot) keepalive_limiter_release(worker->keepalive);
+        free(connection.buffered.data);
+        close(fd);
+    }
+    return NULL;
+}
+
+static bool execute_engine_batch(void *opaque, const int32_t *ids,
+                                 const size_t *offsets, size_t batch_size,
+                                 float *out, char *err, size_t err_len) {
+    ei_engine *engine = opaque;
+    if (!engine->model.embeddinggemma2 || media_slot_count)
+        return ei_engine_embed_tokens_batch(engine, ids, offsets, batch_size, out, err, err_len);
+    // CPU backend: media towers share the engine's thread pool with text waves.
+    pthread_mutex_lock(&inference_mutex);
+    bool ok = ei_engine_embed_tokens_batch(opaque, ids, offsets, batch_size, out, err, err_len);
+    pthread_mutex_unlock(&inference_mutex);
+    return ok;
+}
+
+// Pipeline slots: each slot owns a separate engine context, and media runs on
+// its own context, so text waves need no global lock.
+static bool execute_engine_batch_slot(void *opaque, size_t slot, const int32_t *ids,
+                                      const size_t *offsets, size_t batch_size, float *out,
+                                      char *err, size_t err_len) {
+    return ei_engine_embed_tokens_batch_slot(opaque, slot, ids, offsets, batch_size, out, err,
+                                             err_len);
+}
+
+int main(int argc, char **argv) {
+    signal(SIGPIPE, SIG_IGN);
+
+    server_opts opts;
+    if (!parse_args(argc, argv, &opts)) {
+        usage(argv[0]);
+        return 2;
+    }
+
+    char *model_path = resolve_model_path(&opts);
+    ensure_model_available(model_path, opts.profile->url);
+    /* --model remains compatible with existing scripts; identify its profile. */
+    ei_gguf probe;
+    ei_gguf_open(&probe, model_path);
+    const ei_kv *arch = ei_gguf_kv(&probe, "general.architecture", true);
+    bool second = arch->type == EI_GGUF_STRING && arch->v.s.len == strlen("gemma-embedding2") &&
+                  !memcmp(arch->v.s.str, "gemma-embedding2", arch->v.s.len);
+    ei_gguf_close(&probe);
+    const ei_profile *detected = &ei_profiles[second ? 0 : 1];
+    if (opts.profile_explicit && opts.profile != detected)
+        ei_die("--profile and model architecture disagree");
+    opts.profile = detected;
+    if (!opts.batch_tokens_explicit) opts.max_batch_tokens = !strcmp(opts.backend, "kfd") ? 2048 : (second ? 8192 : 4096);
+
+    if (!second && opts.projector_path) ei_die("--mmproj requires embeddinggemma-2");
+
+    // --threads sizes the engine's own pool (EI_THREADS semantics); CPU
+    // workers split it among themselves.
+    if (opts.threads) {
+        char value[32];
+        snprintf(value, sizeof value, "%zu", opts.threads);
+        setenv("EI_THREADS", value, 1);
+    }
+#if defined(EI_ENABLE_CUDA)
+    if (opts.cuda_all_devices) {
+        int count = ei_gemma2_cuda_device_count();
+        if (count < 1) ei_die("--cuda-devices all: no CUDA device");
+        for (int d = 0; d < count && d < EI_MAX_EXECUTORS; d++)
+            opts.cuda_devices[opts.cuda_device_count++] = d;
+    }
+    // The engine loads on the first listed device.
+    if (opts.cuda_device_count) {
+        char value[32];
+        snprintf(value, sizeof value, "%d", opts.cuda_devices[0]);
+        setenv("EI_CUDA_DEVICE", value, 1);
+    }
+#else
+    if (opts.cuda_all_devices || opts.cuda_device_count)
+        ei_die("--cuda-devices requires a CUDA build");
+#endif
+
+    fprintf(stderr, "loading model: %s\n", model_path);
+    ei_engine engine;
+    ei_engine_load_backend(&engine, model_path, opts.backend);
+    opts.engine = &engine;
+    ei_gguf projector = {0};
+    if (second && !opts.text_only && strcmp(opts.backend, "kfd")) {
+        char *dir = dirname_copy(model_path);
+        char *path = opts.projector_path ? dup_z(opts.projector_path)
+                                         : path_join(dir, opts.profile->projector_file);
+        free(dir);
+        ensure_model_available(path, opts.profile->projector_url);
+        ei_gguf_open(&projector, path);
+        ei_gemma2_validate_projector(&projector);
+        opts.projector = &projector;
+        free(path);
+    }
+    uint64_t cache_fingerprint = opts.persistent_cache_path
+        ? model_fingerprint(model_path) : 0;
+    free(model_path);
+    char reserve_error[256];
+    if (!ei_engine_reserve(&engine, opts.max_batch_tokens,
+                           opts.max_batch_requests,
+                           reserve_error, sizeof reserve_error)) {
+        ei_die("cannot reserve inference workspace: %s", reserve_error);
+    }
+    bool implied_slots = opts.short_bypass_tokens && opts.pipeline_slots < 2;
+    if (implied_slots) opts.pipeline_slots = 2;
+    bool cpu_backend = !strcmp(ei_engine_backend(&engine), "cpu");
+    ei_executor_config executors = {
+        .pipeline_slots = cpu_backend ? 1 : opts.pipeline_slots,
+        .cuda_devices = opts.cuda_device_count ? opts.cuda_devices : NULL,
+        .cuda_device_count = opts.cuda_device_count,
+        // On the CPU backend one worker is the engine itself.
+        .cpu_workers = cpu_backend && opts.cpu_workers < 2 ? 0 : opts.cpu_workers,
+        .cpu_threads = (int32_t)opts.threads,
+        .cpu_pin = opts.cpu_pin,
+    };
+    if (cpu_backend && implied_slots && !executors.cpu_workers) {
+        fprintf(stderr, "short-request bypass disabled: needs a GPU or --cpu-workers >= 2\n");
+        opts.short_bypass_tokens = 0;
+    } else if (cpu_backend && opts.pipeline_slots > 1 && !implied_slots) {
+        ei_die("cannot create pipeline slots: pipeline slots > 1 require EmbeddingGemma 2 on "
+               "Metal or CUDA");
+    }
+    if (!ei_engine_configure_executors(&engine, &executors, reserve_error, sizeof reserve_error)) {
+        if (!implied_slots) ei_die("cannot create executors: %s", reserve_error);
+        fprintf(stderr, "short-request bypass disabled: %s\n", reserve_error);
+        opts.short_bypass_tokens = 0;
+        executors.pipeline_slots = 1;
+        if (!ei_engine_configure_executors(&engine, &executors, reserve_error,
+                                           sizeof reserve_error))
+            ei_die("cannot create executors: %s", reserve_error);
+    }
+    opts.pipeline_slots = engine.executor_count > 1 ? engine.executor_count : 1;
+    if (second && opts.projector) {
+        char err[256];
+        (void)err; /* used by the GPU builds only */
+        for (size_t i = 0; i < opts.media_slots; i++) {
+            media_slot *slot = &media_slots[i];
+            pthread_mutex_init(&slot->lock, NULL);
+#if defined(EI_ENABLE_METAL)
+            if (engine.gemma2_metal) {
+                slot->metal = i == 0 && engine.gemma2_media
+                                  ? engine.gemma2_media
+                                  : ei_gemma2_metal_clone(engine.gemma2_metal, err, sizeof err);
+                if (!slot->metal) ei_die("media slot %zu: %s", i, err);
+            }
+#endif
+#if defined(EI_ENABLE_CUDA)
+            if (engine.gemma2_cuda) {
+                slot->cuda = i == 0 && engine.gemma2_cuda_media
+                                 ? engine.gemma2_cuda_media
+                                 : ei_gemma2_cuda_clone(engine.gemma2_cuda, false, err, sizeof err);
+                if (!slot->cuda) ei_die("media slot %zu: %s", i, err);
+            }
+#endif
+            if (slot->metal || slot->cuda) media_slot_count = i + 1;
+        }
+#if defined(EI_ENABLE_METAL)
+        const char *finish_batch = getenv("EI_MEDIA_FINISH_BATCH");
+        if (engine.gemma2_metal && media_slot_count && !(finish_batch && !strcmp(finish_batch, "0"))) {
+            media_finisher.ctx = ei_gemma2_metal_clone(engine.gemma2_metal, err, sizeof err);
+            if (!media_finisher.ctx) ei_die("media finish context: %s", err);
+            pthread_t thread;
+            if (pthread_create(&thread, NULL, media_finisher_run, NULL))
+                ei_die("cannot start the media finish thread");
+            pthread_detach(thread);
+            media_finisher.enabled = true;
+        }
+        const char *audio_batch = getenv("EI_MEDIA_AUDIO_BATCH");
+        if (engine.gemma2_metal && media_slot_count && !(audio_batch && !strcmp(audio_batch, "0"))) {
+            media_audio_batcher.ctx = ei_gemma2_metal_clone(engine.gemma2_metal, err, sizeof err);
+            if (!media_audio_batcher.ctx) ei_die("media audio context: %s", err);
+            media_audio_batcher.projector = opts.projector;
+            pthread_t thread;
+            if (pthread_create(&thread, NULL, media_audio_batcher_run, NULL))
+                ei_die("cannot start the media audio thread");
+            pthread_detach(thread);
+            media_audio_batcher.enabled = true;
+        }
+#endif
+    }
+    // Each keep-alive connection holds an HTTP worker, so workers cap the
+    // requests in flight; give every executor enough to fill its waves.
+    if (!opts.workers_explicit && opts.workers < 32 * engine.executor_count) {
+        opts.workers = 32 * engine.executor_count;
+        const char *keepalive = getenv("EI_HTTP_KEEPALIVE");
+        if (!opts.keepalive_explicit && !(keepalive && !strcmp(keepalive, "0")))
+            opts.keepalive_connections = opts.workers / 2u;
+    }
+    uint8_t slot_group[EI_MAX_EXECUTORS];
+    bool slot_overflow[EI_MAX_EXECUTORS];
+    size_t slot_budget[EI_MAX_EXECUTORS];
+    for (size_t i = 0; i < engine.executor_count; i++) {
+        slot_group[i] = engine.executors[i].group;
+        slot_overflow[i] = engine.executors[i].overflow;
+        // CPU workers take waves they finish promptly, spreading the queue.
+        slot_budget[i] = engine.executors[i].kind == EI_EXECUTOR_CPU ? opts.cpu_max_batch_tokens : 0;
+        const ei_executor *x = &engine.executors[i];
+        fprintf(stderr, "executor %zu (group %u): ", i, x->group);
+        if (x->kind == EI_EXECUTOR_CPU)
+            fprintf(stderr, "cpu worker, %d threads%s\n", ei_thread_pool_threads(x->pool),
+                    x->overflow ? ", overflow" : "");
+#if defined(EI_ENABLE_CUDA)
+        else if (x->kind == EI_EXECUTOR_CUDA)
+            fprintf(stderr, "cuda:%d\n", ei_gemma2_cuda_device(x->ctx));
+#endif
+        else
+            fprintf(stderr, "metal\n");
+    }
+    ei_inference_service_config service_config = {
+        .cache_entries = opts.cache_entries,
+        .max_batch_tokens = opts.max_batch_tokens,
+        .strict_max_input_tokens = engine.gemma2_kfd ? 2048 : 0,
+        .max_batch_requests = opts.max_batch_requests,
+        .max_batch_sequence_tokens = opts.max_batch_sequence_tokens,
+        .tokenizer_workers = opts.tokenizer_workers,
+        .batch_wait_us = opts.batch_wait_us,
+        .cache_path = opts.persistent_cache_path,
+        .cache_fingerprint = cache_fingerprint,
+        .pipeline_slots = opts.pipeline_slots,
+        .short_bypass_tokens = opts.short_bypass_tokens,
+        .execute_slot = opts.pipeline_slots > 1 ? execute_engine_batch_slot : NULL,
+        .slot_group = engine.executor_count > 1 ? slot_group : NULL,
+        .slot_overflow = engine.executor_count > 1 ? slot_overflow : NULL,
+        .overflow_max_sequence_tokens = opts.cpu_max_sequence_tokens,
+        .slot_max_batch_tokens = engine.executor_count > 1 ? slot_budget : NULL,
+    };
+    ei_inference_service *service = ei_inference_service_create(
+        &engine.tokenizer, execute_engine_batch, &engine, &service_config);
+    if (!service) ei_die("invalid inference service configuration");
+    ei_response_cache *response_cache = ei_response_cache_create(
+        opts.response_cache_bytes, 4096);
+    if (second && opts.projector)
+        media_cache = ei_response_cache_create(opts.media_cache_bytes, 1024);
+
+    socket_queue connection_queue;
+    socket_queue_init(&connection_queue, opts.max_queue);
+    keepalive_limiter keepalive;
+    keepalive_limiter_init(&keepalive, opts.keepalive_connections);
+    pthread_t *workers = ei_xmalloc(opts.workers * sizeof(*workers));
+    server_worker *worker_contexts = ei_xmalloc(
+        opts.workers * sizeof(*worker_contexts));
+    for (size_t i = 0; i < opts.workers; i++) {
+        worker_contexts[i] = (server_worker){
+            .queue = &connection_queue, .keepalive = &keepalive,
+            .service = service, .response_cache = response_cache,
+            .opts = &opts,
+        };
+        if (pthread_create(&workers[i], NULL, server_worker_main,
+                           &worker_contexts[i]) != 0) {
+            ei_die("failed to create HTTP worker %zu", i);
+        }
+    }
+
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) ei_die("socket failed: %s", strerror(errno));
+    int yes = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)opts.port);
+    if (inet_pton(AF_INET, opts.bind_host, &addr.sin_addr) != 1) {
+        ei_die("invalid --bind address '%s' (IPv4 only in this build)", opts.bind_host);
+    }
+    if (bind(s, (struct sockaddr *)&addr, sizeof addr) != 0) {
+        ei_die("bind %s:%d failed: %s", opts.bind_host, opts.port, strerror(errno));
+    }
+    if (listen(s, (int)opts.max_queue) != 0) {
+        ei_die("listen failed: %s", strerror(errno));
+    }
+
+    fprintf(stderr,
+            "embeddinggemma.c serving %s on http://%s:%d (%s backend, "
+            "%zu workers, %zu batch tokens, %zu-token packing cutoff, "
+            "%zu cache entries, %zu keep-alive connections, "
+            "%zu MiB response cache)\n",
+            opts.profile->name, opts.bind_host, opts.port, ei_engine_backend(&engine), opts.workers,
+            opts.max_batch_tokens, opts.max_batch_sequence_tokens, opts.cache_entries,
+            opts.keepalive_connections, opts.response_cache_bytes / (1024u * 1024u));
+
+    /* Graceful shutdown so the persistent cache is flushed. sigaction without
+     * SA_RESTART makes accept() return EINTR when a stop signal arrives. */
+    if (opts.persistent_cache_path) {
+        struct sigaction action;
+        memset(&action, 0, sizeof action);
+        action.sa_handler = handle_stop_signal;
+        sigemptyset(&action.sa_mask);
+        action.sa_flags = 0;
+        sigaction(SIGTERM, &action, NULL);
+        sigaction(SIGINT, &action, NULL);
+    }
+    while (!g_stop_requested) {
+        int c = accept(s, NULL, NULL);
+        if (c >= 0) {
+            int nodelay = 1;
+            setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof nodelay);
+        }
+        if (c < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "accept failed: %s\n", strerror(errno));
+            continue;
+        }
+        if (!socket_queue_try_push(&connection_queue, c)) {
+            http_error(c, 503, "Service Unavailable",
+                       "server request queue is full", false);
+            close(c);
+        }
+    }
+    if (opts.persistent_cache_path) {
+        fprintf(stderr, "shutting down; persisting exact cache\n");
+        ei_inference_service_dump_cache(service);
+    }
+    return 0;
+}

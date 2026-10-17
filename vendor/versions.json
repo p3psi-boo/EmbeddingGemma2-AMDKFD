@@ -1,0 +1,12 @@
+{
+  "libkfd": {
+    "repository": "https://github.com/jhuber6/libkfd",
+    "commit": "dabb4cdeb3bc2354573daa3e3f7afaf7e08ee2e2",
+    "license": "Apache-2.0"
+  },
+  "embeddinggemma.c": {
+    "repository": "https://github.com/QuixiAI/embeddinggemma.c",
+    "commit": "d8f9e336393e7ba53d47184beac5c9ce9e734311",
+    "license": "MIT"
+  }
+}

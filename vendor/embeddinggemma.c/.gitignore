@@ -1,0 +1,10 @@
+build/
+build-*/
+dist/
+*.o
+testdata/*.gguf
+__pycache__/
+*.pyc
+.reference
+model/
+.xpu-deps/

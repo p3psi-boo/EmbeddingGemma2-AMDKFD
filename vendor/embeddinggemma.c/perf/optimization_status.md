@@ -1,0 +1,3929 @@
+# Optimization Status
+
+Raw benchmark output belongs under `perf/results/`; durable conclusions belong
+here.
+
+## Entry Template
+
+```text
+## YYYY-MM-DD: <kernel or pass name>
+
+Status: not started | baselining | experimenting | candidate | landed | deferred.
+Current implementation:
+Current public route:
+References inspected:
+Correctness:
+Baseline:
+Experiments:
+Decision:
+Open questions:
+Raw results:
+```
+
+Record enough context to reproduce the run: machine, OS, compiler/toolchain,
+backend, command, git label, dtype, shape, quant format, warmups, iterations,
+median, variance, correctness tolerance, observed error, and raw result path.
+
+## 2026-07-19: Perf Scaffold
+
+Status: landed.
+
+Current implementation: added a C-native benchmark harness and Python runner for
+the active CPU kernel surface.
+
+Current public route: `python3 perf/bench_kernels.py --preset quick`.
+
+References inspected:
+
+- `QuixiCore-Metal/perf/README.md`
+- `QuixiCore-Metal/perf/perf.md`
+- `QuixiCore-Metal/perf/bench_kernels.py`
+- `QuixiCore-Metal/perf/baseline_status.md`
+- `QuixiCore-Metal/perf/optimization_status.md`
+
+Correctness: harness includes scalar checks for q4/q8 dot and matmul rows.
+
+Baseline: not recorded yet.
+
+Decision: mirror QuixiCore's result layout and notebook discipline, but keep the
+first harness native C because this repository currently exposes C kernels.
+
+Open questions: add accelerator-backed cases once ROCm/SYCL launch
+APIs are wired into the repo.
+
+Raw results: none.
+
+## 2026-07-19: CPU And Metal Kernel Completion
+
+Status: landed.
+
+Current implementation: NEON/AVX2/SSE CPU row kernels, vectorized full/SWA
+attention, and fused QK norm+RoPE, norm+residual, and final norm+pool paths.
+Metal has family-separated translation units compiled into one metallib using
+the QuixiCore-Metal direct `xcrun metal` build pattern.
+
+References inspected:
+
+- `llama.cpp/ggml/src/ggml-cpu/*/quants.c`
+- `llama.cpp/ggml/src/ggml-metal/ggml-metal.metal`
+- `QuixiCore-CPU/kernels/quantization/qgemv_neon.cpp`
+- `QuixiCore-Metal/kernels/quantization/qgemv/qgemv.metal`
+- `QuixiCore-Metal/kernels/norms/rms_norm/rms_norm.metal`
+- `QuixiCore-Metal/kernels/norms/add_norm/add_norm.metal`
+- `QuixiCore-Metal/kernels/norms/qk_norm_rope/qk_norm_rope.metal`
+- `QuixiCore-Metal/kernels/attention/attn_multiwarp/attn_multiwarp.metal`
+- `QuixiCore-Metal/bindings/mlx/cmake/extension.cmake`
+
+Correctness: CPU kernel reference tests pass with maximum attention error
+`1.61e-6`; model parity passes all 10 samples with minimum cosine
+`0.999862850` against llama.cpp.
+
+Baseline: see `perf/baseline_status.md`. Q4 GEMV is currently about
+`31 GFLOP/s` and `8.7` packed-weight GB/s; T=128 attention is about
+`35 GFLOP/s`.
+
+Decision: retain direct GGUF block consumption on both backends. Metal offers
+both direct Q4_0 x F32 and CPU-parity Q4_0 x Q8_0 projection routes. Add the
+model-specific online-softmax attention and final pooling kernels because the
+generic decomposed forms add avoidable launches and global-memory traffic.
+
+Metal build validation: Xcode 26.6 with Metal Toolchain `17F109` compiles the
+seven translation units into `embeddinggemma.metallib`. At this stage, the
+native smoke test loaded the library and created all 12 expected compute
+pipelines on Apple M5 Max; the final inventory is 24.
+
+Open questions: benchmark direct F32 versus activation-quantized Metal
+projection and add dispatch timings before tuning simdgroups/output rows.
+
+Raw results: `perf/results/2026-07-19/000431-cpu-quick/`.
+
+## 2026-07-19: Optimization Loop Pass 1 - Projection Accumulation And FFN Fusion
+
+Status: CPU landed; Metal experiment rejected. Significant-gain streak reset;
+consecutive no-gain passes: 0.
+
+Current implementation: CPU Q4_0 x Q8_0 keeps NEON/AVX2/SSSE3 SIMD lane
+accumulators live across the complete K dimension and horizontally reduces once.
+For one-token inference, bounded-row Q4 projections use a four-way schedule on
+the persistent worker pool; per-worker conditions wake only the workers assigned
+to a job. Metal retains the separate up/gate projection plus GELU dispatch.
+
+Current public route: CPU SIMD projection for all Q4 matmuls, with row-parallel
+projection at T=1 and token-parallel projection otherwise. Metal uses fused QKV
+and up/gate dispatches, but not the experimental GELU epilogue fusion.
+
+References inspected:
+
+- `llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c`
+- `llama.cpp/ggml/src/ggml-cpu/arch/x86/quants.c`
+- `QuixiCore-Metal/perf/perf.md` (decision threshold and fusion rules)
+- `QuixiCore-Metal/kernels/quantization/qgemv/qgemv.metal`
+
+Correctness: CPU model parity 10/10, minimum cosine `0.999860704`; experimental
+Metal fusion parity 10/10, minimum cosine `0.999910414`. Q4 microbench maximum
+relative error after reassociation was `4.24e-5`, within model parity tolerance.
+
+Baseline and retained CPU result on Apple M5 Max, `-O2`, 5 warmups and 30 timed
+samples for kernels:
+
+| shape | before ms | after ms | improvement |
+|---|---:|---:|---:|
+| Q4 GEMV N768 K768 | 0.04365 | 0.03871 | 11.3% |
+| Q4 GEMV N1152 K768 | 0.06395 | 0.05693 | 11.0% |
+| Q4 GEMV N768 K1152 | 0.06567 | 0.05389 | 17.9% |
+| full graph, T=1 | 6.43 | 2.81 | 56.3% |
+
+Metal experiment: compute up and gate for the same row in one kernel and apply
+GELU in registers, removing the up intermediate and one dispatch per layer.
+Controlled same-binary A/B with 5-8 warmups and 30-50 iterations found only
+1-3% at T=1..3, regressions of 2-3% at T=4/8, and less than 1.2% at T=32/128.
+
+Decision: retain CPU SIMD accumulation, bounded-row API, exact worker wakeups,
+and short-input row scheduling. Remove the Metal FFN epilogue kernels: their
+small-shape result is below the 8-10% threshold warranted by the added kernel
+complexity and does not hold at the GEMM crossover.
+
+Open questions: vectorize CPU Q8 quantization; sweep Metal GEMV/GEMM crossover
+and tile-token geometry with the durable engine harness.
+
+Raw results: `perf/results/2026-07-19/023732-pass0-baseline/` and
+`perf/results/2026-07-19/023900-pass1-ffn-fusion/`.
+
+## 2026-07-19: Optimization Loop Pass 2 - Q8 Packing And Metal Route Crossover
+
+Status: CPU and Metal landed. Significant-gain streak reset; consecutive
+no-gain passes: 0.
+
+Current implementation: CPU Q8_0 activation quantization uses ties-away NEON
+conversion plus saturating vector narrows (and an equivalent AVX2 pack path).
+Metal selects direct Q4 GEMV below 160 tokens and the staged 32-row x 8-token
+Q4 GEMM at 160 tokens and above. `EI_METAL_GEMM_MIN_TOKENS` remains an
+experimental override for repeatable route sweeps.
+
+References inspected:
+
+- `llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c` (`quantize_row_q8_0`)
+- `llama.cpp/ggml/src/ggml-cpu/arch/x86/quants.c`
+- `QuixiCore-Metal/perf/perf.md` (routing and Apple staging guidance)
+- `QuixiCore-Metal/perf/optimization_status.md` (direct-vs-staged findings)
+
+Correctness: CPU and Metal model parity each pass 10/10. Minimum cosine is
+`0.999860704` for CPU and `0.999910235` for Metal. Q8 quantization remains exact
+against the scalar ties-away oracle in the native harness.
+
+CPU experiment, 5 warmups and 30 samples:
+
+| shape | scalar-store ms | SIMD-pack ms | improvement |
+|---|---:|---:|---:|
+| Q8 quant K768 | 0.0001216 | 0.0000973 | 20.0% |
+| Q8 quant K1152 | 0.0001802 | 0.0001636 | 9.2% |
+
+Metal experiment: sweep `gemm_min_tokens` through
+`1,2,4,8,16,32,64,128,256,512,2049` with 4-5 warmups and 15-30 iterations.
+The staged GEMM's threadgroup-memory traffic and two barriers per K block lose
+to direct cache-resident loads at small and medium M.
+
+| tokens | old route ms | retained route ms | improvement |
+|---|---:|---:|---:|
+| 4 | 5.60 GEMM | 2.06 GEMV | 63.2% |
+| 8 | 6.04 GEMM | 2.43 GEMV | 59.8% |
+| 32 | 7.48 GEMM | 4.78 GEMV | 36.1% |
+| 64 | 10.83 GEMM | 8.32 GEMV | 23.2% |
+| 128 | 18.86 GEMM | 17.24 GEMV | 8.6% |
+| 224 | 33.91 GEMV | 30.71 GEMM | 9.4% |
+| 256 | 39.59 GEMV | 34.65 GEMM | 12.5% |
+| 512 | 81.09 GEMV | 66.84 GEMM | 17.6% |
+
+Decision: retain both changes. A threshold of 160 is conservative at the noisy
+crossover (T=160 was approximately equal); it captures the large direct-load
+wins below that point and the staged reuse wins above it.
+
+Open questions: test Q4 dual-row CPU accumulation; tune or remove staging inside
+the long-M Metal GEMM now that its useful shape range is known.
+
+Raw results: `perf/results/2026-07-19/024309-pass2-metal-threshold-1/` through
+`024315-pass2-metal-threshold-2049/`, `024331-pass2-metal-long-threshold-32/`
+through `024345-pass2-metal-long-threshold-2049/`, and
+`perf/results/2026-07-19/024454-pass2-retained/`.
+
+## 2026-07-19: Optimization Loop Pass 3 - CPU Width And Metal 16x16 Tile
+
+Status: CPU and Metal landed. Significant-gain streak reset; consecutive
+no-gain passes: 0.
+
+Current implementation: the one-token CPU projection path uses six total
+threads. Long-prefill Metal Q4 GEMM uses a 16-output-row x 16-token tile with
+256 threads; direct GEMV remains selected below 64 tokens.
+
+References inspected:
+
+- `QuixiCore-Metal/perf/perf.md` (tile sweeps, staging/reuse, route retesting)
+- `QuixiCore-Metal/kernels/quantization/qgemm/qgemm.metal`
+- `llama.cpp/ggml/src/ggml-metal/ggml-metal.metal`
+
+Correctness: CPU and Metal llama.cpp parity remain 10/10 with minimum cosines
+`0.999860704` and `0.999910235`. A new route-boundary test compares T=
+`1,4,63,64,96,160,192,512`: old Metal 32x8 and new 16x16 output cosine is
+`1.000000000` for every shape. CPU/Metal synthetic-token cosine is reported as
+a diagnostic (minimum `0.997155726`) rather than used as an oracle because the
+CPU route quantizes activations and the Metal route intentionally consumes F32.
+
+CPU experiment: sweep `EI_CPU_SHORT_THREADS=1,2,3,4,5,6,7,8`, 5 warmups and
+30-50 iterations at T=1. Six threads measured `2.52-2.55 ms` versus
+`2.79-2.85 ms` for four threads, a repeatable 9-11% improvement. Seven and
+eight threads regressed to `3.34-3.68 ms` on the heterogeneous M5 Max.
+
+Metal experiment: compare 32x8 and 16x16 in the same metallib, 4 warmups and 12
+iterations. The 16x16 tile halves staged weight traffic over the token grid
+while preserving 256 outputs per threadgroup.
+
+| tokens | 32x8 ms | 16x16 ms | improvement |
+|---|---:|---:|---:|
+| 160 | 23.09 | 17.96 | 22.2% |
+| 192 | 26.85 | 20.85 | 22.4% |
+| 256 | 34.94 | 27.05 | 22.6% |
+| 512 | 67.34 | 52.21 | 22.5% |
+| 1024 | 137.24 | 107.59 | 21.6% |
+
+The crossover was re-swept after changing the tile: GEMV wins 15-18% at T=32,
+the routes are effectively equal at T=64, and 16x16 GEMM wins 9% at T=96 and
+15-20% at T=128/160. The retained default threshold is therefore 64.
+
+Decision: retain six-way CPU projection, the 16x16 Metal QKV/general/up-gate
+GEMMs, and the 64-token crossover. Keep the old 32x8 kernels as a tested route
+and A/B control for now; `EI_METAL_GEMM_TILE_TOKENS=8|16` selects them.
+
+Open questions: test CPU dual-output Q4 accumulation and Metal tile rows/tokens
+beyond the two balanced 256-output geometries.
+
+Raw results: `perf/results/2026-07-19/025144-pass3-retained-rebuilt/` (the
+earlier `025102` run is explicitly stale and must not be used).
+
+## 2026-07-19: Optimization Loop Pass 4 - Dual CPU Dot And Metal Storage Mode
+
+Status: CPU landed; Metal experiment rejected. Significant-gain streak reset;
+consecutive no-gain passes: 0.
+
+Current implementation: paired CPU projections use a dual-output Q4_0 x Q8_0
+dot. K/V and up/gate share each Q8 activation load and scale conversion while
+maintaining independent SIMD accumulators. Metal model weights remain in a
+shared unified-memory buffer.
+
+References inspected:
+
+- `llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c` (multi-result dot paths)
+- `llama.cpp/ggml/src/ggml-cpu/arch/x86/quants.c`
+- `QuixiCore-Metal/perf/perf.md` (memory-byte hypothesis and A/B rules)
+
+Correctness: CPU llama.cpp parity remains 10/10, minimum cosine
+`0.999860704`; controlled dual on/off output checksums are identical.
+
+CPU controlled same-binary A/B, 4 warmups and 20 iterations, two alternating
+runs per route:
+
+| tokens | separate ms | dual ms | improvement |
+|---|---:|---:|---:|
+| 4 | 8.22 | 7.51 | 8.6% |
+| 8 | 13.59 | 12.45 | 8.4% |
+| 32 | 32.17 | 29.83 | 7.3% |
+| 128 | 85.03 | 75.64 | 11.0% |
+
+T=1 was noisy and only about 3%, but the realistic multi-token shapes all clear
+the local-change threshold. The retained T=512 median is `298.96 ms` versus
+`368.48 ms` in the pre-dual Pass 3 run, though that cross-run delta also includes
+system variance and is not used as the acceptance metric.
+
+Metal experiment: copy the 271 MiB tensor data section to
+`MTLResourceStorageModePrivate` once at initialization, then compare with the
+shared buffer. Two alternating runs at T=`1,32,128,512` differed by less than
+1% at every shape (`52.11-52.19 ms` at T=512). Unified-memory caches erase the
+expected storage-mode distinction.
+
+Decision: retain dual CPU projections and the scalar fallback/AVX2 equivalent.
+Remove the Metal private-storage branch because it adds upload time, memory, and
+code without a runtime gain.
+
+Open questions: prefetching and output-row unrolling in the CPU dot; Metal
+attention/GQA reuse now that Q4 projection is substantially faster.
+
+Raw results: `perf/results/2026-07-19/025746-pass4-retained/`.
+
+## 2026-07-19: Optimization Loop Pass 5 - Online CPU Attention And Shared GQA
+
+Status: experiments rejected. Consecutive no-significant-gain passes: 1 of 3.
+
+Current implementation: unchanged retained three-pass CPU attention and
+single-simdgroup-per-query/head Metal online attention.
+
+References inspected:
+
+- `QuixiCore-Metal/kernels/attention/attn_multiwarp/attn_multiwarp.metal`
+- `QuixiCore-Metal/perf/optimization_status.md` (GQA staging rejection)
+- `llama.cpp/ggml/src/ggml-metal/ggml-metal.metal` attention kernels
+
+Correctness: both experiments produced finite outputs. Metal shared-GQA output
+checksums were identical to the retained route. CPU online accumulation changed
+sampled full-graph output values, so it would require a fresh tolerance audit
+even if it were faster.
+
+CPU experiment: fuse max tracking, exponentiation, and V accumulation into one
+online pass, eliminating the score buffer and separate softmax pass. Two
+alternating runs at T=128/512 (3 warmups, 10 iterations) regressed roughly
+6-8%: `78.7-83.6 ms` retained versus `83.6-90.5 ms` online at T=128, and
+`316.5-344.5 ms` versus `339.1-365.3 ms` at T=512. Repeated output rescaling
+when the running maximum changes outweighs the removed scalar score pass.
+
+Metal experiment: one 96-thread group per query, one simdgroup per Q head,
+staging the shared GQA K/V head once. At T=`128,512,1024,2048` it regressed
+approximately 3-6% in the first alternating pair and more under sustained load.
+The two barriers per key and 3x smaller threadgroup grid cost more than the
+reduced K/V reads, reproducing QuixiCore's prior Apple result.
+
+Decision: remove both experimental implementations. This is the first pass
+without a retained >=3% realistic-shape gain.
+
+Open questions: CPU prefetch/unroll and Metal command-buffer/dispatch overhead.
+
+Raw results: focused same-binary command output only; no retained result set.
+
+## 2026-07-19: Optimization Loop Pass 6 - Compiler Optimization Levels
+
+Status: experiments rejected. Consecutive no-significant-gain passes: 2 of 3.
+
+Current implementation: unchanged C `-O2` and Metal `-O2 -fno-fast-math`.
+
+References inspected:
+
+- `QuixiCore-Metal/perf/perf.md` (variance, warmup, and numerical decision rules)
+- Xcode Metal compiler help for supported optimization flags
+
+Correctness: O2/O3 output checksums were identical on both backends. Fast math
+was not enabled, so this pass did not relax numerical semantics.
+
+CPU experiment: separately linked O2 and O3 full-engine binaries, alternated at
+T=`1,4,32,128,512`, 4 warmups and 15 iterations. In the stabilized second pair,
+O3 was neutral at T=4 (`8.67` versus `8.74 ms`) and 1-2% slower at T=128/512
+(`86.82/351.53` versus `85.16/346.84 ms`). The earlier pair favored O2 more
+strongly and confirms there is no hidden O3 win.
+
+Metal experiment: separately compiled O2 and O3 metallibs, selected through
+`EI_METALLIB_PATH`, alternated at T=`32,128,512,2048`. Results were order- and
+temperature-sensitive: O3 was roughly 20% slower than the first cool O2 run,
+then about 7% faster than a heat-soaked O2 run. This is variance, not a compiler
+effect; no consistent shape-local advantage survived both pairs.
+
+Decision: retain O2. O3 adds no reproducible benefit and is not accepted based
+on a thermally confounded run.
+
+Open questions: launch overhead and small row-kernel fusion.
+
+Raw results: focused alternate-binary command output only; experimental
+artifacts remain under ignored `build/` until the final clean rebuild.
+
+## 2026-07-19: Optimization Loop Pass 7 - Embedding Parallelism And QK Launch Fusion
+
+Status: Metal landed; CPU experiment rejected. Significant-gain streak reset;
+consecutive no-gain passes: 0.
+
+Current implementation: CPU embedding gather remains sequential. Metal combines
+Q and K RMSNorm, NEOX RoPE, and Q scaling in one four-head dispatch per layer.
+
+References inspected:
+
+- `QuixiCore-Metal/kernels/norms/qk_norm_rope/qk_norm_rope.metal`
+- `QuixiCore-Metal/perf/perf.md` (launch-bound fusion criteria)
+- `llama.cpp/ggml/src/ggml-metal/ggml-metal.metal` RoPE specialization
+
+Correctness: CPU and Metal llama.cpp parity remain 10/10 at minimum cosines
+`0.999860704` and `0.999910235`. Fused/unfused Metal output checksums are
+identical for every benchmark shape.
+
+CPU experiment: parallelize Q8 embedding row gathers with grain 4. The isolated
+row cost is too small to amortize a pool launch. Alternating runs at
+T=`4,32,128,512` show the parallel route consistently slower, roughly 4-11% in
+the first pair, with no output difference.
+
+Metal experiment: replace separate Q and K norm/RoPE dispatches with one
+model-specialized dispatch over the fixed 3Q+1K heads. Two alternating runs,
+5 warmups and 20 iterations:
+
+| tokens | separate ms | fused ms | improvement |
+|---|---:|---:|---:|
+| 1 | 1.90-1.96 | 1.74-1.75 | 8-11% |
+| 4 | 2.11-2.13 | 1.98-1.99 | 6-7% |
+| 32 | 5.58-5.61 | 5.38-5.44 | 3-4% |
+| 128 | 15.92-15.96 | 15.80 | <1% |
+| 512 | 56.98-57.13 | 56.87-57.07 | neutral |
+
+Decision: remove CPU embedding parallelism. Retain fused QK norm/RoPE for all
+Metal shapes because it clears the local-change threshold on latency-sensitive
+short inputs and does not regress long inputs. `EI_METAL_FUSED_QK_ROPE=0`
+keeps a reproducible diagnostic route.
+
+Open questions: fuse other tiny Metal row operations only where dispatch count
+can fall without repeating projection work.
+
+Raw results: `perf/results/2026-07-19/030744-pass7-retained/`.
+
+## 2026-07-19: Optimization Loop Pass 8 - CPU Row Prefetch And Metal Fast Math
+
+Status: experiments rejected. Consecutive no-significant-gain passes: 1 of 3.
+
+Current implementation: unchanged compiler semantics and hardware-managed CPU
+cache behavior.
+
+References inspected:
+
+- `QuixiCore-Metal/perf/perf.md` (minimum-win and numerical acceptance rules)
+- Apple Metal compiler help for `-ffast-math` and `-fno-fast-math`
+
+Correctness: the fast-math metallib passed all 10 llama.cpp golden vectors at
+minimum cosine `0.999910474`. CPU prefetch did not change output checksums.
+
+CPU experiment: prefetch each packed Q4 row two output rows ahead in single and
+dual projections. A second stabilized alternating pair at T=`1,4,32,128`
+measured retained/prefetch times of `3.865/3.987`, `9.465/9.566`,
+`32.707/33.005`, and `89.024/87.198 ms`. The only improvement was 2.1% at
+T=128, below the local-change threshold, while short inputs regressed. Apple
+hardware prefetching already covers this sequential access pattern.
+
+Metal experiment: compile the same source with `-O2 -ffast-math`. Two
+alternating pairs at T=`1,4,32,128,512` found realistic-shape improvements of
+0-2.7%. The apparent 5-8% T=1/4 result occurred in only one pair at the GPU
+launch floor and did not reproduce consistently; T=32 was neutral in the
+second pair and T=128/512 remained below 2%.
+
+Decision: remove explicit Q4 prefetch and retain Metal `-fno-fast-math`. Neither
+experiment provides a stable >=3% gain, and relaxed floating-point semantics
+are not justified by sub-threshold throughput changes.
+
+Open questions: CPU attention job grain and redundant exponentials in Metal
+online softmax.
+
+Raw results: focused alternate-binary and alternate-metallib command output;
+experimental artifacts remain under ignored `build/` until the final clean.
+
+## 2026-07-19: Optimization Loop Pass 9 - CPU Attention Grain And One-Exp Metal Softmax
+
+Status: experiments rejected. Consecutive no-significant-gain passes: 2 of 3.
+
+Current implementation: unchanged one-query CPU scheduling and branchless
+two-exponential Metal online-softmax recurrence.
+
+References inspected:
+
+- `QuixiCore-Metal/kernels/attention/attn_fwd/`
+- `QuixiCore-Metal/perf/perf.md` (latency, divergence, and variance guidance)
+- `llama.cpp/ggml/src/ggml-metal/ggml-metal.metal` online attention recurrence
+
+Correctness: CPU grain variants produced identical checksums. The one-exp
+Metal variant passed all 10 golden vectors at minimum cosine `0.999910235` and
+also produced identical benchmark checksums.
+
+CPU experiment: group 2 or 4 adjacent attention queries into each persistent
+pool job instead of one query per job. In the first alternating run at
+T=`32,128,512`, grain 1 measured `30.14/79.66/319.80 ms`, grain 2
+`31.33/84.02/338.65 ms`, and grain 4 `31.24/85.62/352.09 ms`. A reverse-order
+run moved the apparent winner with temperature and did not reproduce a stable
+advantage for either coarser grain. Fewer atomic job claims do not compensate
+for reduced load balancing across queries with different attention spans.
+
+Metal experiment: replace the branchless `max` update and two exponentials
+with a simdgroup-uniform branch and exactly one exponential per key. In the
+first pair at T=`32,128,512,1024,2048`, it regressed roughly 4-7%. The reverse
+pair was approximately tied through T=1024, while T=2048 became thermally
+unstable. No shape showed a reproducible gain. The compiler/SFU can overlap the
+branchless formulation more effectively than the explicit control dependency.
+
+Decision: retain grain-1 CPU attention and branchless Metal online softmax.
+Neither change clears the handbook threshold in both A/B orderings.
+
+Open questions: eliminate repeated RoPE `pow` work, which is pure scalar side
+work on both backends.
+
+Raw results: focused same-binary CPU and alternate-metallib Metal command
+output; no retained result set.
+
+## 2026-07-19: Optimization Loop Pass 10 - Precomputed Metal RoPE
+
+Status: Metal landed; CPU experiment rejected. Significant-gain streak reset;
+consecutive no-gain passes: 0.
+
+Current implementation: CPU retains direct scalar `powf/cosf/sinf`. The Metal
+engine builds model-specific full/SWA `[cos,sin]` tables once and fused QK
+norm/RoPE kernels consume them as `float2` values.
+
+References inspected:
+
+- `llama.cpp/ggml/src/ggml-metal/ggml-metal-ops.cpp` RoPE argument handling
+- `QuixiCore-Metal/kernels/norms/qk_norm_rope/qk_norm_rope.metal`
+- `QuixiCore-Metal/perf/perf.md` scalar-side-work and realistic-shape rules
+
+Correctness: CPU kernel tests remain exact and llama.cpp parity remains 10/10
+at minimum cosine `0.999860704`. Metal parity is 10/10 at minimum cosine
+`0.999910295`; output differences from device transcendental approximations are
+well inside the existing tolerance.
+
+CPU experiment: use the same 2 MiB full/SWA table in `build_qkv`. The first
+baseline/table pair showed 2-10% table regressions, while the reverse pair
+showed 2-5% apparent gains. Run order, not the variant, controlled the result.
+The CPU path therefore keeps its existing math and does not pay table startup
+or memory costs.
+
+Metal experiment: replace per-layer, per-head `powr/cos/sin` with a cached
+`float2` load. In the first baseline/table pair the table improved T=1 by 4.0%,
+T=1024 by 1.7%, and other shapes by 0-1%. In the reverse pair it improved
+T=`4,32,128,1024,2048` by approximately `3.5,7.3,4.7,2.1,4.3%`; T=1 was
+1.6% slower. Across both orders there is no long-shape regression and several
+latency-sensitive shapes clear the 3% local-change threshold.
+
+Decision: retain Metal-only precomputed RoPE tables. Generate them in the Metal
+engine so CPU model load and inference remain unchanged. This removes repeated
+special-function work without adding a dispatch.
+
+Open questions: reduce the four identical table reads per token/dimension by
+sharing values inside one 128-thread QK threadgroup, but measure the required
+barrier before retaining it.
+
+Raw results: `perf/results/2026-07-19/032143-pass10-retained/` plus focused
+alternate-binary/metallib A/B output.
+
+## 2026-07-19: Optimization Loop Pass 11 - Fused CPU QK And Shared Metal RoPE
+
+Status: CPU landed; Metal experiment rejected. Significant-gain streak reset;
+consecutive no-gain passes: 0.
+
+Current implementation: CPU jointly normalizes and rotates fixed 3Q+1K heads,
+evaluating each angle once and folding Q scaling into the final write. Metal
+retains one independent simdgroup per Q/K head.
+
+References inspected:
+
+- `QuixiCore-Metal/kernels/norms/qk_norm_rope/qk_norm_rope.metal`
+- `QuixiCore-Metal/perf/optimization_status.md` barrier/staging rejections
+- `llama.cpp/ggml/src/ggml-metal/ggml-metal.metal` simdgroup RoPE layout
+
+Correctness: the fused CPU kernel is bit-identical to separate Q and K paths in
+the focused test. CPU and Metal llama.cpp parity remain 10/10 at minimum
+cosines `0.999860704` and `0.999910295`, respectively.
+
+CPU experiment: compute four RMS factors up front, evaluate each RoPE angle once
+for Q and K, combine norm/rotation/Q-scale writes, and avoid a second trig loop.
+Across two orderings, T=1 improved from `3.565/3.561 ms` to `3.364/3.401 ms`
+(4.5-5.6%). The first pair was mixed by -4% to +1% at T=4..512; the reverse
+pair favored fusion by 2.6-10%. The repeatable short-input win clears 3%, and
+no long-shape regression reproduces across orderings.
+
+Metal experiment: put all four heads in one 128-thread group, load 128 `float2`
+table entries once into threadgroup memory, and synchronize once. It regressed
+T=1 by 3-6% in both orders and T=32 by about 1.5%; T>=128 was neutral. The
+cache-resident duplicate reads are cheaper than a barrier and larger scheduling
+unit.
+
+Decision: retain fused CPU QK norm/RoPE and its exact unit test. Restore Metal's
+four independent 32-thread groups.
+
+Open questions: CPU trig calls are still scalar; direct platform `sincosf`
+availability and Metal Q4 GEMV output-row sharing remain candidates.
+
+Raw results: focused alternate-binary/metallib A/B output and
+`perf/results/2026-07-19/032638-pass11-retained/`.
+
+## 2026-07-19: Optimization Loop Pass 12 - CPU RoPE Recurrence And Metal R4 GEMV
+
+Status: Metal landed; CPU experiment rejected. Significant-gain streak reset;
+consecutive no-gain passes: 0.
+
+Current implementation: CPU retains exact per-dimension RoPE powers. Metal uses
+one-row Q4 GEMV below T=8, four-row register-reuse GEMV at T=8..63, and 16x16
+GEMM at T>=64.
+
+References inspected:
+
+- `llama.cpp/ggml/src/ggml-metal/ggml-metal-impl.h` (`N_R0_Q4_0=4`)
+- `llama.cpp/ggml/src/ggml-metal/ggml-metal.metal`
+  `mul_vec_q_n_f32_impl`
+- `QuixiCore-Metal/perf/perf.md` route-boundary and packed-weight guidance
+
+Correctness: the R4 kernels preserve checksums and Metal llama.cpp parity is
+10/10 at minimum cosine `0.999910295`. CPU recurrence passed broad golden
+parity but missed the focused K tolerance by `5.66e-6`; after rebasing every
+eight dimensions it still missed and changed long-shape checksums.
+
+CPU experiment: derive each RoPE frequency from a geometric recurrence, reducing
+128 `powf` calls to one, then to 17 with periodic rebasing. The bounded version
+regressed T=32..512 by roughly 7-10% in its first A/B pair and did not satisfy
+the existing per-element test. Exact `powf` remains the production route.
+
+Metal experiment: cache the 16 activation values owned by each lane and update
+four output-row accumulators, matching llama.cpp's Q4_0 row factor. The route
+was implemented for generic, QKV, and up/gate direct projections. Across two
+sequential orderings, R4 improved T=8 by about 12%, T=16 by 16%, T=32 by
+14-21%, and T=63 by 21-39%. T=1 was inconsistent, so it stays on R1; T>=64
+continues to use the retained GEMM route.
+
+Decision: retain separate R1 and R4 kernels and default
+`EI_METAL_GEMV_R4_MIN_TOKENS=8`. The environment route accepts 1..64 for
+reproducible diagnostics. Reject CPU recurrence.
+
+Open questions: test R2 as a lower-register route for T=1..7; do not assume R4
+is optimal at the launch floor.
+
+Raw results: focused alternate-binary/metallib A/B output and
+`perf/results/2026-07-19/033410-pass12-retained/`.
+
+## 2026-07-19: Optimization Loop Pass 13 - CPU Triple QKV And Metal R2 GEMV
+
+Status: CPU landed; Metal experiment rejected. Significant-gain streak reset;
+consecutive no-gain passes: 0.
+
+Current implementation: one-token CPU QKV projection shares each Q8 activation
+block across corresponding Q, K, and V rows, then computes remaining Q rows.
+Multi-token CPU inference keeps separate Q plus dual K/V. Metal keeps R1 below
+T=8 and R4 from T=8 through 63.
+
+References inspected:
+
+- `llama.cpp/ggml/src/ggml-cpu` multi-row Q4 GEMV declarations
+- `llama.cpp/ggml/src/ggml-metal/ggml-metal.metal` register-cached activation
+  layout
+- `QuixiCore-CPU/kernels/quantization/qgemv_neon.cpp`
+
+Correctness: triple NEON/AVX2/scalar paths preserve full CPU checksums and
+llama.cpp parity remains 10/10 at minimum cosine `0.999860704`. Metal R2 also
+preserved checksums and 10/10 parity at `0.999910295`.
+
+CPU experiment: compute the first 256 Q/K/V rows together, keeping Q8 values
+live across three dot products, and reduce one-token scheduler work from 1280
+logical rows to 768. Across two orderings, T=1 improved from `3.522/3.665 ms`
+to `3.083/3.099 ms` (12-15%). Multi-token results were mixed in the first pair
+and favored triple only when run first, so token-parallel inference retains the
+lower-risk existing route.
+
+Metal experiment: change the R4 kernels to two output rows and compare R1, R2,
+and R4 at T=`1,4,7`. R2 was order-sensitive at T=1, improved T=4 by only 1%,
+and improved T=7 by 3-4% versus R1 but was effectively tied with R4. Adding a
+third route has no justified range.
+
+Decision: retain triple QKV only for CPU T=1, including NEON and AVX2
+implementations. Restore Metal R4 and its T=8 threshold.
+
+Open questions: one-token QKV scheduler width may change now that logical work
+is 40% smaller; re-sweep only that width rather than the global short width.
+
+Raw results: focused alternate-binary/metallib A/B output and
+`perf/results/2026-07-19/033914-pass13-retained/`.
+
+## 2026-07-19: Optimization Loop Pass 14 - CPU Width And Metal T=7 Boundary
+
+Status: Metal route update landed; CPU experiment rejected. Significant-gain
+streak reset; consecutive no-gain passes: 0.
+
+Current implementation: CPU one-token projections retain width 6. Metal uses
+R1 below T=7, R4 at T=7..63, and GEMM at T>=64.
+
+References inspected:
+
+- `QuixiCore-Metal/perf/perf.md` route-boundary and variance rules
+- Pass 3 CPU width sweep and Pass 12 R1/R4 measurements in this notebook
+
+Correctness: every route/width produced identical checksums. No arithmetic was
+changed.
+
+CPU experiment: re-sweep `EI_CPU_SHORT_THREADS` after triple QKV reduced the
+logical one-token projection from 1280 to 768 rows. An initial cool run favored
+width 4 by over 20%, but a sustained alternating width 4/5/6 run measured only
+1-2.5% differences and changed apparent ordering. The initial result is thermal,
+not a reproducible scheduler win.
+
+Metal experiment: compare R1 (`EI_METAL_GEMV_R4_MIN_TOKENS=8`) with R4
+(`=7`) at exactly T=7 using 10 warmups and 50 iterations in four alternating
+pairs. R1 medians were `2.309,2.312,2.345,2.3135 ms`; paired R4 medians were
+`2.229,2.2315,2.2465,2.2205 ms`, a consistent 3.5-4.2% gain.
+
+Decision: retain CPU width 6. Lower the default Metal R4 threshold from 8 to 7;
+T<=6 remains on R1 and all other route boundaries stay unchanged.
+
+Open questions: reduce CPU one-token pool synchronization itself; test Metal
+R4 at T=6 only if a controlled run clears 3%.
+
+Raw results: focused high-iteration same-binary route A/B output and
+`perf/results/2026-07-19/034112-pass14-retained/`.
+
+## 2026-07-19: Optimization Loop Pass 15 - CPU Adjacent Rows And Metal T=6
+
+Status: CPU landed; Metal route experiment rejected. Significant-gain streak
+reset; consecutive no-gain passes: 0.
+
+Current implementation: one-token CPU generic Q4 projections process three
+adjacent weight rows with a shared Q8 activation load. Metal R4 still starts at
+T=7.
+
+References inspected:
+
+- `llama.cpp/ggml/src/ggml-cpu` multi-row Q4 GEMV kernels
+- `QuixiCore-CPU/kernels/quantization/qgemv_neon.cpp`
+- `QuixiCore-Metal/perf/perf.md` minimum route-win guidance
+
+Correctness: the adjacent-row helper uses the exact triple dot from Pass 13;
+focused output error is zero and CPU llama.cpp parity remains 10/10 at minimum
+cosine `0.999860704`. Metal route checksums were identical.
+
+CPU experiment: group adjacent rows in attention-output/down projections and
+the remaining Q projection into triple NEON/AVX2 accumulators. Three alternating
+T=1 comparisons measured retained/candidate medians of `3.2665/2.9395`,
+`3.3135/2.8875`, and `3.2275/2.7965 ms`, consistent 10-13% gains.
+
+Metal experiment: compare R1 (`threshold=7`) and R4 (`threshold=6`) at T=6
+with four 10-warmup/50-iteration alternating pairs. R4 improved only 0.8-1.4%,
+below the 3% route threshold.
+
+Decision: retain CPU adjacent-row triple accumulation for one-token single
+matrices. Keep Metal R4 minimum at 7.
+
+Open questions: up/gate already shares two matrices but not adjacent rows;
+raising accumulator count further may hit register pressure. Pool wakeup cost is
+now a larger fraction of T=1 latency.
+
+Raw results: focused alternate-binary CPU and same-binary Metal route output and
+`perf/results/2026-07-19/034324-pass15-retained/`.
+
+## 2026-07-19: Optimization Loop Pass 16 - CPU Dual Adjacent Rows And Metal T=5/6
+
+Status: experiments rejected. Consecutive no-significant-gain passes: 1 of 3.
+
+Current implementation: unchanged dual up/gate rows and Metal R4 threshold 7.
+
+References inspected:
+
+- Pass 15 adjacent-row CPU results
+- `QuixiCore-Metal/perf/perf.md` low-risk 3% acceptance threshold
+
+Correctness: all variants produced identical checksums; the CPU candidate also
+passed 10/10 llama.cpp parity at `0.999860704`.
+
+CPU experiment: replace three adjacent dual up/gate calls (three Q8 scans) with
+one triple-up plus one triple-gate call (two scans). Three alternating T=1
+pairs showed 2.6%, 1.0%, and 6.9% improvements. The effect is smaller than run
+variance and does not clear 3% consistently.
+
+Metal experiment: R4 versus R1 at T=6 improved only 0.8-1.4% across four pairs.
+At T=5, four additional pairs improved 0.8-2.6%. Both are below threshold.
+
+Decision: remove CPU dual-adjacent helper and retain the simpler dual dot.
+Keep Metal R4 minimum at 7. This is the first pass without a retained gain
+since Pass 15.
+
+Open questions: command encoding and pool synchronization overhead; further
+row-factor changes now have diminishing returns.
+
+Raw results: focused alternating command output only; no retained result set.
+
+## 2026-07-19: Optimization Loop Pass 17 - CPU Thread Saturation And Metal T=4
+
+Status: experiments rejected. Consecutive no-significant-gain passes: 2 of 3.
+
+Current implementation: CPU defaults to all 18 online cores; Metal uses R1 at
+T=4.
+
+References inspected:
+
+- `QuixiCore-Metal/perf/perf.md` realistic-shape and route guidance
+- current persistent CPU pool scheduling in `src/parallel.c`
+
+Correctness: all CPU thread counts and Metal routes produced identical
+checksums.
+
+CPU experiment: compare 8, 12, and 18 total threads at T=`32,128,512` in
+forward and reverse order. Eighteen threads measured `29.3-31.7`,
+`75.1-81.6`, and `314.1-325.1 ms`; 12 threads measured `30.9-32.3`,
+`100.3-102.8`, and `413.3-416.5 ms`. Eight threads was substantially slower.
+Efficiency cores contribute useful projection throughput; a performance-core
+cap is a regression.
+
+Metal experiment: compare R1 and R4 at T=4 in four 10-warmup/50-iteration
+pairs. R1 medians were `1.9335-1.9385 ms`; R4 was `1.9370-1.9585 ms`, neutral
+to roughly 1% slower.
+
+Decision: keep the 18-thread CPU default and R1 Metal route at T=4. This is the
+second consecutive pass without a retained gain.
+
+Open questions: T=1 Metal launch overhead and CPU pool wakeup cost remain, but
+both now require structural changes rather than route tuning.
+
+Raw results: focused alternating command output only; no retained result set.
+
+## 2026-07-19: Optimization Loop Pass 18 - CPU Native Target And Metal Crossover
+
+Status: Metal route update landed; CPU experiment rejected. Significant-gain
+streak reset; consecutive no-gain passes: 0.
+
+Current implementation: portable CPU target flags; Metal R4 is the default for
+the entire T=7..2048 range. The 16x16 GEMM remains available through
+`EI_METAL_GEMM_MIN_TOKENS` for diagnostics.
+
+References inspected:
+
+- Apple clang predefined architecture features with and without `-mcpu=native`
+- `llama.cpp/ggml/src/ggml-metal/ggml-metal.metal` R4 GEMV
+- `QuixiCore-Metal/perf/perf.md` crossover and thermal-order guidance
+
+Correctness: CPU compiler variants produced identical checksums. Metal R4 and
+GEMM checksums differ only by expected floating-point accumulation order;
+route parity was already validated at cosine 1.0 and both pass golden parity.
+
+CPU experiment: compile the full engine with `-mcpu=native`, exposing M5 I8MM,
+BF16, and SME features. Native lost 3-6% on long shapes when run second and won
+2-5% when run first; T=1 was similarly order-sensitive. Current intrinsics
+already use dot-product instructions, and no native-only benefit survives
+thermal reversal.
+
+Metal experiment: re-sweep R4 after Pass 12 against 16x16 staged GEMM. Across
+both orders, R4 improved T=64..256 by 20-30%, T=384..768 by roughly 14-23%,
+and usually improved T=1024..2048. In the adverse hot-second ordering at
+T=1536/2048, R4 was only 1-2% slower than the cool-first GEMM result; the
+reverse ordering favored R4 by 10-16%. GEMM has no reproducible winning shape.
+
+Decision: retain portable CPU flags. Set the default Metal GEMM threshold to
+2049, outside the supported context, so R4 serves all production prefill
+shapes. Keep staged kernels and route flag for future hardware/toolchain tests.
+
+Open questions: now that direct R4 dominates, test modest function-level
+unrolling/register pressure only; staged-memory work is deprioritized.
+
+Raw results: focused alternate-binary CPU and same-binary Metal route output and
+`perf/results/2026-07-19/035114-pass18-retained/`.
+
+## 2026-07-19: Optimization Loop Pass 19 - CPU R2 And Metal R8
+
+Status: experiments rejected. Consecutive no-significant-gain passes: 1 of 3.
+
+Current implementation: CPU adjacent-row factor 3 and Metal output-row factor
+4 remain unchanged.
+
+References inspected:
+
+- `llama.cpp/ggml/src/ggml-metal/ggml-metal-impl.h` (`N_R0_Q4_0=4`)
+- retained Pass 13/15 CPU triple-dot measurements
+
+Correctness: R2/R3 and R4/R8 variants produced identical checksums; both full
+backends passed 10/10 golden parity at their retained cosine levels.
+
+CPU experiment: replace adjacent triple accumulation with pairs using the dual
+dot. Across three alternating T=1 pairs, R2 measured `2.97-3.04 ms` versus
+`2.57-2.83 ms` for R3, a 7-18% regression.
+
+Metal experiment: raise all direct Q4 kernels from four to eight output rows per
+simdgroup. R8 regressed T=7 by roughly 8% and T=32 by 1-8%. T=128..2048 was
+order-sensitive: gains were 1-4% when R8 ran second and larger only when the R4
+comparison ran last/hot. No long-shape gain reproduced above threshold.
+
+Decision: restore CPU R3 and Metal R4. This is the first no-gain pass after
+Pass 18.
+
+Open questions: projection factors are now bounded on both sides; focus any
+remaining pass on non-projection overhead.
+
+Raw results: focused alternate-binary/metallib output only; no retained set.
+
+## 2026-07-19: Optimization Loop Pass 20 - CPU LTO And Metal Command References
+
+Status: experiments rejected. Consecutive no-significant-gain passes: 2 of 3.
+
+Current implementation: portable per-file CPU compilation and normal retained
+Metal command buffers remain unchanged.
+
+References inspected:
+
+- `QuixiCore-Metal/perf/perf.md` alternating A/B and significance rules
+- Metal command-buffer descriptor ownership contract
+
+Correctness: CPU LTO produced the same checksums at every measured shape.
+Metal retained and unretained command buffers also produced identical checksums.
+
+CPU experiment: compile the complete CPU engine using Clang LTO (`-flto`)
+and alternate it with the retained `-O2` binary at T=`1,32,128,512`, using five
+warmups and 20 iterations. LTO was 8-10% slower at T=32..512 in the first pair.
+The reverse pair became heat/order dominated, with neither binary winning
+consistently. T=1 moved in both directions and had no stable gain.
+
+Metal experiment: create command buffers with
+`MTLCommandBufferDescriptor.retainedReferences=NO`, relying on the engine-owned
+resources that outlive synchronous execution. Four alternating runs at
+T=`1,32,128,512`, with eight warmups and 30 iterations, were neutral within
+roughly 1% through T=128. T=512 had wider variance and unretained references
+were not consistently faster.
+
+Decision: reject both experiments. Cross-file optimization does not improve the
+hot CPU kernels, and Objective-C resource retaining is not material relative to
+GPU execution.
+
+Open questions: one final pass should probe submission/encoder overhead on Metal
+and a local CPU scheduling or code-generation detail without changing arithmetic.
+
+Raw results: focused alternating command output only; no retained result set.
+
+## 2026-07-19: Optimization Loop Pass 21 - CPU QoS And Metal Enqueue
+
+Status: experiments rejected. Consecutive no-significant-gain passes: 3 of 3.
+The optimization loop stop condition is satisfied.
+
+Current implementation: CPU workers retain their inherited scheduler class;
+Metal command buffers are encoded before normal commit.
+
+References inspected:
+
+- `QuixiCore-Metal/perf/perf.md` variance and stable-improvement requirements
+- `llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m` explicit `enqueue`
+  before asynchronous multi-command-buffer encoding
+
+Correctness: all CPU QoS and Metal enqueue variants produced identical
+checksums at each measured shape.
+
+CPU experiment: opt worker threads into `QOS_CLASS_USER_INTERACTIVE`, then run
+four alternating measurements at T=`1,32,128,512`, with five warmups and 20
+iterations. T=1 was neutral in the first pair and order-sensitive in the
+second. Sustained shapes regressed roughly 4-8% in the first pair, with no
+reverse-order recovery beyond the common thermal decline.
+
+Metal experiment: call `enqueue` immediately after command-buffer creation,
+before encoding the graph. An initial alternating set suggested a noisy T=32
+benefit, so a six-run focused set used 15 warmups and 60 iterations at
+T=`1,32,128`. Differences remained under about 2%, changed sign, and T=128 was
+effectively identical. llama.cpp's enqueue is useful for asynchronously encoded
+multiple command buffers; this engine synchronously encodes one buffer.
+
+Decision: reject both experiments and stop after three consecutive no-gain
+passes (19-21). Retained performance work remains the CPU triple/adjacent-row
+projection path and fused QK processing, plus Metal R4 direct projections,
+fused QK processing, and precomputed RoPE.
+
+Open questions: future work should begin with hardware counters or a new model
+shape/quant format. Further local factor, route, compiler, and submission tuning
+is below the current significance threshold.
+
+Raw results: focused alternating command output only; no retained result set.
+
+## Final Retained Results Versus Baseline
+
+The durable Pass 0 engine result was recorded after Pass 1's CPU SIMD
+accumulation had already landed. The controlled pre-Pass-1 CPU T=1 measurement
+was `6.43 ms`; the retained Pass 15 result is `2.7015 ms`, or 2.38x throughput
+across the complete loop.
+
+For a consistent durable-run comparison, use Pass 0 versus Pass 15 for CPU and
+Pass 0 versus Pass 18 for Metal:
+
+| backend | tokens | durable baseline ms | retained ms | x throughput |
+|---|---:|---:|---:|---:|
+| CPU | 1 | 2.8115 | 2.7015 | 1.04x after Pass 1 |
+| CPU | 4 | 8.1850 | 7.3460 | 1.11x |
+| CPU | 8 | 13.9265 | 12.7595 | 1.09x |
+| CPU | 32 | 33.1840 | 30.4570 | 1.09x |
+| CPU | 128 | 89.0110 | 79.9670 | 1.11x |
+| Metal | 1 | 2.7150 | 1.7550 | 1.55x |
+| Metal | 4 | 5.5565 | 1.9500 | 2.85x |
+| Metal | 8 | 6.0475 | 2.2270 | 2.72x |
+| Metal | 32 | 7.4550 | 3.9955 | 1.87x |
+| Metal | 128 | 18.7990 | 12.4720 | 1.51x |
+
+The retained CPU numbers are from
+`perf/results/2026-07-19/034324-pass15-retained/`; retained Metal numbers are
+from `perf/results/2026-07-19/035114-pass18-retained/` except T=8, which uses
+Pass 15 because Pass 18 did not repeat that shape. Pass 18 did not change CPU
+code, but its CPU rows were thermally degraded and are not used for comparison.
+
+### Current 2048-Token Measurement
+
+A fresh full-context run used three warmups and 10 timed iterations:
+
+| backend | tokens | median ms | p20/p80 ms | tokens/s |
+|---|---:|---:|---:|---:|
+| CPU | 2048 | 1516.559 | 1483.693/1554.584 | 1350.4 |
+| Metal | 2048 | 195.699 | 194.886/197.354 | 10465.1 |
+
+Metal delivers 7.75x CPU throughput for this 2048-token request. Raw results:
+`perf/results/2026-07-19/083016-final-2k/`.
+
+## 2026-07-19: Concurrent 2048-Token Baseline
+
+Status: historical serialized baseline; superseded by the dynamic batching
+results below.
+
+Current implementation: `server.c` accepts and handles one connection at a
+time. CPU and Metal engines also own mutable activation workspaces, so calling
+one engine concurrently is unsafe. The benchmark uses concurrent arrival
+threads and a ticket-ordered engine mutex to model the existing single-engine
+FIFO queue, without HTTP parsing, model loading, or unsafe overlapping writes.
+
+Method: synthetic 2048-token requests, one warmed engine, concurrency
+T=`1,2,4,8,16,32`, at least four requests per level. Forward and reverse sweeps
+separate thermal/order effects. Request p50/p95 includes time waiting for the
+engine. Aggregate throughput uses wall time from synchronized release through
+the final completion.
+
+Isolated reverse-order results:
+
+| backend | concurrency | req/s | input tok/s | p50/p95 ms |
+|---|---:|---:|---:|---:|
+| CPU | 1 | 0.605 | 1239.0 | 1647.0/1665.5 |
+| CPU | 2 | 0.612 | 1254.0 | 3258.2/3266.8 |
+| CPU | 4 | 0.607 | 1242.4 | 3305.2/6593.9 |
+| CPU | 8 | 0.610 | 1249.1 | 6469.0/13116.7 |
+| CPU | 16 | 0.627 | 1283.9 | 12748.5/25523.0 |
+| CPU | 32 | 0.616 | 1261.4 | 26128.3/50362.5 |
+| Metal | 1 | 4.586 | 9392.6 | 217.6/219.6 |
+| Metal | 2 | 4.607 | 9434.8 | 433.6/434.7 |
+| Metal | 4 | 4.558 | 9334.2 | 447.9/877.6 |
+| Metal | 8 | 4.605 | 9431.5 | 865.3/1737.1 |
+| Metal | 16 | 4.699 | 9623.9 | 1700.9/3404.8 |
+| Metal | 32 | 4.983 | 10204.6 | 3151.4/6214.6 |
+
+Decision: concurrency does not scale inference throughput today. CPU remains
+within 4% of `0.61 req/s`; Metal remains in a roughly 9% sustained-clock band
+around `4.6-5.0 req/s`. Tail latency grows approximately with queue depth.
+Connection threads alone cannot remove this ceiling; the engine needs packed
+request batching or multiple workspace slots sharing one immutable model.
+
+Raw results:
+
+- `perf/results/2026-07-19/090738-concurrency-2k-metal-fifo/`
+- `perf/results/2026-07-19/090945-concurrency-2k-cpu-fifo/`
+
+The earlier `084206`, `084404`, and `084613` runs are superseded: their plain
+pthread mutex could serve waiting clients out of order and inflate low-level
+p95 latency.
+
+## 2026-07-19: vLLM/TEI Serving And Kernel Pass
+
+Status: retained scheduler, cache, CPU, and packed-batch changes; three Metal
+and CPU fusion experiments rejected.
+
+References inspected:
+
+- `.reference/vllm/vllm/v1/core/sched/scheduler.py`: waiting/running queues and
+  token/sequence budgets.
+- `.reference/vllm/vllm/config/scheduler.py` and `config/vllm.py`: hardware
+  batch budgets and asynchronous scheduling disabled by default for pooling.
+- `.reference/vllm/csrc/cpu/micro_gemm/`: reuse one packed weight load across
+  several activation rows.
+- `.reference/vllm/vllm/model_executor/layers/quantization/utils/fp8_utils.py`:
+  gated activation plus output quantization epilogues.
+- `.reference/text-embeddings-inference/core/src/queue.rs` and `infer.rs`: FIFO
+  token-budget batches, bounded concurrency, flattened tokens, and one backend
+  owner with per-request completions.
+
+### Retained Engine Changes
+
+CPU fused RMS norm plus Q8 activation quantization avoids a materialized
+768/1152-float normalized row. Alternating measurements retained about 1.07x
+throughput at T=1 and were neutral at T=32/128, with exact output checksums.
+
+The CPU long-input route quantizes all activation rows, then applies a four-row
+Q4 x Q8 micro-GEMM so packed weights stay hot across rows. Short and medium
+inputs regressed because of extra thread-pool phases, so the production
+threshold is T=512. Alternating long-shape measurements retained approximately
+1.08x throughput at T=512 and 1.23x at T=2048. CPU/Metal mixed-batch cosine is
+1.0; llama.cpp golden acceptance remains 0.999860704 or better.
+
+CPU packed execution serializes the two-one-token corner, which changed its
+measured throughput ratio from 0.75x to 1.01x. Larger short batches use the
+flattened packed graph.
+
+### Packed Batch Results
+
+Packed versus repeated single-request execution on one warmed engine:
+
+| backend | tokens/request | batch | x throughput |
+|---|---:|---:|---:|
+| CPU | 1 | 4/8/16/32 | 1.35x/2.18x/2.23x/3.07x |
+| Metal | 1 | 4/8/16/32 | 3.55x/6.43x/10.12x/14.69x |
+| CPU | 32 | 2/4/8/16/32 | 1.24x/1.49x/1.62x/1.76x/1.97x |
+| Metal | 32 | 2/4/8/16/32 | 1.27x/1.51x/1.66x/1.70x/1.68x |
+| CPU | 2048 | 2 | 0.984x |
+| Metal | 2048 | 2 | 0.974x |
+
+Decision: pack short requests and keep sequences over 512 tokens as FIFO
+singletons. This follows vLLM's shape-dependent batch-budget principle; a
+larger batch is not assumed to be faster.
+
+### Serving Architecture
+
+This pass added a bounded socket queue, 32 HTTP workers, and one
+inference-owner thread. The owner forms FIFO batches bounded by 4096 total
+tokens and 32 requests, waits at most 200 us for a partial microbatch, and
+dispatches immediately when a budget is full or the FIFO head cannot combine.
+Array inputs are submitted atomically so one HTTP request can form one backend
+batch. The TEI deep dive below later raises the production admission and backend
+request defaults to 64.
+
+An exact token-ID LRU caches final 768-float embeddings. Pending entries provide
+singleflight: eight concurrent duplicates execute one backend call and share
+the completion. Prefix KV caching was rejected because bidirectional attention
+changes every prefix token when a suffix is added; only exact whole-result
+caching is valid for this model.
+
+The production concurrency harness submits unique cache misses through this
+service. Results include queue wait and observed backend batches:
+
+| backend | tokens | concurrency 1 req/s | concurrency 32 req/s | x throughput | avg batch at 32 |
+|---|---:|---:|---:|---:|---:|
+| CPU | 1 | 294.9 | 1018.0 | 3.45x | 32.0 |
+| Metal | 1 | 468.7 | 6133.5 | 13.09x | 25.6 |
+| CPU | 32 | 28.08 | 59.52 | 2.12x | 32.0 |
+| Metal | 32 | 216.24 | 391.27 | 1.81x | 21.3 |
+
+Full-context batches remained size 1. CPU measured 0.764 req/s at concurrency 1
+and 0.719 req/s at concurrency 4; Metal measured 4.753 req/s at concurrency 1
+and 4.393 req/s at concurrency 8. The small decline is queue/thermal variance,
+not packed execution. Tail latency still scales with queue depth for these long
+singletons.
+
+### Rejected Experiments
+
+- Metal matching-row up/gate projection plus GELU removed one dispatch and an
+  activation memory round trip. R1/R2 variants improved T=1 by about 2%, were
+  roughly neutral at T=7..128, and had no stable long-shape gain. This missed
+  the 3% retention threshold and is disabled by default.
+- Metal matching-row Q/K/V projection reduced short-path simdgroup count from
+  1280 to 768 but regressed T=1..6 by 2.5-4.7% from accumulator pressure. It is
+  disabled by default.
+- CPU GELU/multiply plus Q8 quantization produced exact checksums but was neutral
+  through T=512 and 2.4% slower at T=2048 in in-process alternating A/B. It is
+  disabled by default.
+
+The rejected routes remain available through diagnostic environment controls
+for future GPU/CPU generations. They are not part of the measured production
+configuration.
+
+## 2026-07-19: Text Embeddings Inference Deep Dive
+
+Status: retained service scheduling and allocation changes; model warmup,
+grouped CPU scheduling, and protocol changes rejected or deferred.
+
+References inspected:
+
+- `.reference/text-embeddings-inference/core/src/tokenization.rs`: bounded
+  persistent tokenization workers and cancellation checks.
+- `.reference/text-embeddings-inference/core/src/queue.rs`: FIFO token/request
+  budgets, flattened nonpadded IDs, reserved vectors, and dropped-request
+  filtering.
+- `.reference/text-embeddings-inference/core/src/infer.rs`: one backend owner,
+  one-batch prefetch channel, and result fanout outside the backend task.
+- `.reference/text-embeddings-inference/router/src/main.rs` and `lib.rs`:
+  separate concurrent-request, client-array, tokenizer, and backend budgets.
+- `.reference/text-embeddings-inference/backends/src/lib.rs`: production-shape
+  workspace warmup.
+- `.reference/text-embeddings-inference/backends/candle/src/models/gemma3.rs`:
+  concatenated QKV and gate/up projection schedules, fused residual RMS norm,
+  and device-side pooling.
+
+### Retained Changes
+
+The service now owns a persistent tokenizer pool. Array inputs tokenize in
+parallel while a single input avoids worker handoff. The isolated real-tokenizer
+benchmark measured:
+
+| payload | workers 0 | workers 8 | x throughput | workers 16 |
+|---|---:|---:|---:|---:|
+| 32 inputs x 256 chars | 1.022 ms | 0.239 ms | 4.28x | 0.206 ms |
+| 32 inputs x 4096 chars | 20.427 ms | 3.164 ms | 6.46x | 1.854 ms |
+
+The production default remains eight workers to leave cores for the CPU
+backend; Metal-heavy deployments can raise `--tokenizer-workers`. Client arrays
+are capped independently at 32 inputs, matching TEI's admission boundary.
+
+The inference owner allocates flattened IDs and output storage once at startup
+instead of for every batch. CPU and Metal workspaces are also reserved at the
+configured maximum before accepting connections. Allocation-only reservation
+reduced a cold Metal first request from 18.540 ms to 12.704 ms in the controlled
+startup probe, without running a heat-producing maximum-shape forward pass.
+
+Server defaults now admit 64 active HTTP requests, retain a 256-connection
+backlog, and permit 64 backend requests per batch while keeping the client array
+limit at 32. At concurrency 64, increasing only the backend cap from 32 to 64
+measured:
+
+| backend | tokens | cap 32 req/s | cap 64 req/s | result |
+|---|---:|---:|---:|---:|
+| CPU | 1 | 1064-1078 | 1219-1237 | 1.14-1.16x |
+| CPU | 32 | 71.1-72.5 | 72.4-73.5 | 1.01-1.03x |
+| Metal | 1 | 6880-7219 | 7783-8307 | 1.08-1.21x |
+| Metal | 32 | 392.7-393.0 | 392.7-393.3 | neutral |
+
+This preserves T=32 throughput while giving dispatch-dominated requests more
+room to amortize the graph. Saturated CPU T=32 p50 latency rises because one
+64-request batch completes together instead of two 32-request waves; the cap
+remains configurable for latency-sensitive deployments.
+
+### Rejected And Deferred Ideas
+
+- TEI concatenates QKV and gate/up weights into one logical projection. The
+  existing short CPU and all Metal routes already combine these dispatches. A
+  grouped multirow CPU schedule was order-sensitive: its first cool T=64 pair
+  regressed 3.2%, the reverse pair favored it by 2.1%, and the second pair was
+  within 1%. T=512 followed thermal order. The separate schedules were restored.
+- A real startup forward pass, first through the engine and then through the
+  complete inference service, did not lower first HTTP latency: it remained
+  14-18 ms versus 4.5-7 ms afterward. Only allocation reservation is retained.
+- Formatting a cached 32-embedding, 335 KiB JSON response took 2.8-3.3 ms, so
+  float serialization is not the cache-miss inference bottleneck. This pass did
+  not change the default Ollama-compatible contract; the later Infinity pass
+  added base64 as an explicit opt-in format.
+- TEI drops canceled entries before batching. The current blocking HTTP worker
+  cannot observe a disconnect while awaiting inference without an asynchronous
+  connection-lifecycle redesign; this is deferred rather than approximated.
+- TEI prebuilds one next batch while the backend runs. Here HTTP/tokenizer
+  workers already enqueue subsequent work, and backend flattening is only a
+  bounded memory copy. A second scheduler thread has no measured justification.
+- Padded-token accounting is inapplicable: both production engines consume
+  flattened nonpadded batches. Prefix KV caching remains invalid for this
+  bidirectional embedding graph; exact final-result caching is retained.
+
+## 2026-07-19: Matryoshka Output Dimensions
+
+Status: landed protocol and response optimization; backend pool specialization
+rejected.
+
+Current implementation: CPU and Metal produce and cache one canonical
+768-dimensional L2-normalized embedding. Requests may select 768, 512, 256, or
+128 dimensions. The service copies the cache entry into caller-owned memory,
+then the HTTP path L2-normalizes the selected prefix and serializes only that
+prefix. Dimensions are not part of the exact token-ID cache key.
+
+Reference inspected: `.reference/text-embeddings-inference/core/src/infer.rs`
+truncates Matryoshka output to the requested dimension before normalization.
+The equivalent operation here is prefix normalization of the already
+full-normalized vector.
+
+Correctness: native tests cover every supported dimension, invalid values,
+unit norm, canonical 768 no-op behavior, and untouched suffixes. HTTP tests on
+CPU and Metal cover default compatibility, normalized-prefix equivalence,
+batch behavior, and HTTP 400 errors for invalid values. Maximum observed
+serialized prefix error was below `7e-8`.
+
+The native NEON prefix operation measured 0.000028/0.000039/0.000056 ms at
+128/256/512 dimensions; 768 is a deliberate no-op. The complete CPU final
+RMSNorm, mean-pool, and L2 stage measured 0.000242/0.003874/0.062379 ms at
+1/32/512 tokens. This is well below the 3% end-to-end retention threshold.
+
+Production HTTP results on Apple M5 Max:
+
+| backend | dimensions | payload bytes | cached single ms | cached batch-32 ms | cache miss ms | concurrent req/s | x vs 768 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| CPU | 768 | 10535 | 0.294 | 2.754 | 31.597 | 6408 | 1.00x |
+| CPU | 512 | 6992 | 0.273 | 1.956 | 31.524 | 7359 | 1.15x |
+| CPU | 256 | 3461 | 0.251 | 1.119 | 31.480 | 7208 | 1.12x |
+| CPU | 128 | 1726 | 0.226 | 0.700 | 31.591 | 7277 | 1.14x |
+| Metal | 768 | 10523 | 0.270 | 2.820 | 5.588 | 6179 | 1.00x |
+| Metal | 512 | 6995 | 0.263 | 1.928 | 5.526 | 6993 | 1.13x |
+| Metal | 256 | 3463 | 0.228 | 1.118 | 5.548 | 7290 | 1.18x |
+| Metal | 128 | 1724 | 0.207 | 0.717 | 5.523 | 7176 | 1.16x |
+
+Decision: retain post-cache prefix normalization and shorter JSON responses.
+Do not add dimension-specific CPU or Metal pool kernels. Cache-miss inference is
+flat across dimensions, Metal already pools in one fused simdgroup dispatch,
+and producing less than 768 channels would prevent cross-dimension cache reuse.
+
+Raw results:
+
+- `perf/results/2026-07-19/145805-cpu-dimensions/`
+- `perf/results/2026-07-19/145832-metal-dimensions/`
+
+## 2026-07-19: Infinity Deep Dive
+
+Status: retained optional packed-float responses and bounded fit-aware
+scheduling; uniform workloads remain neutral.
+
+Reference inspected at Infinity commit
+`1eb4396b9c7711111224b31c09eda71fbce93075`:
+
+- `.reference/infinity/libs/infinity_emb/infinity_emb/inference/queue.py` takes
+  several batch windows, sorts by estimated length, and filters completed work.
+- `.reference/infinity/libs/infinity_emb/infinity_emb/inference/batch_handler.py`
+  pipelines preprocessing, device inference, and postprocessing through bounded
+  queues.
+- `.reference/infinity/libs/infinity_emb/infinity_emb/fastapi_schemas/pymodels.py`
+  offers opt-in base64 float32 embeddings.
+- `.reference/infinity/libs/infinity_emb/infinity_emb/inference/caching_layer.py`
+  races an experimental persistent disk cache against inference.
+- `.reference/infinity/libs/infinity_emb/infinity_emb/inference/select_model.py`
+  warms short and 512-token shapes and can create multiple device replicas.
+- `.reference/infinity/libs/infinity_emb/infinity_emb/transformer/utils_optimum.py`
+  enables TensorRT CUDA graphs for small layers.
+
+### Retained Changes
+
+`encoding_format="base64"` now returns each normalized embedding as little-endian
+float32 bytes inside one base64 JSON string. The default `float` response is
+unchanged. At 768 dimensions on Apple M5 Max:
+
+| backend | format | bytes | cached single ms | cached batch-32 ms | c32 req/s |
+|---|---|---:|---:|---:|---:|
+| CPU | float | 10535 | 0.269 | 2.770 | 6049 |
+| CPU | base64 | 4115 | 0.122 | 0.258 | 6767 |
+| Metal | float | 10523 | 0.268 | 2.777 | 6038 |
+| Metal | base64 | 4115 | 0.131 | 0.274 | 6878 |
+
+This is a 61% smaller payload, 2.05x-2.20x cached single-response throughput,
+10.1x-10.7x cached batch-32 throughput, and 1.12x-1.14x c32 throughput.
+Cache-miss latency was flat, as expected. CPU and Metal HTTP tests decode every
+supported Matryoshka size, verify byte counts and unit norms, and reject unknown
+formats.
+
+The scheduler adapts Infinity's backlog sorting to this runtime's flattened,
+nonpadded execution. It always dispatches the oldest request, then scans at most
+`8 * max_batch_requests` queued entries for sequences that fit the request and
+token budgets. This avoids sorting and starvation while allowing short work to
+skip over an unpackable blocker.
+
+Paired Metal runs at concurrency 64 measured:
+
+| token pattern | scheduler | req/s | backend batches | p50 ms |
+|---|---|---:|---:|---:|
+| `1,513` | FIFO | 39.32-41.68 | 48-53 | 797-844 |
+| `1,513` | lookahead | 41.18-41.31 | 33-34 | 5.6-486 |
+| `1,1,1,513` | FIFO | 79.60-79.62 | 29-30 | 449-502 |
+| `1,1,1,513` | lookahead | 81.93-82.47 | 17 | 6.7-6.9 |
+
+The second mix gains 1.029x-1.036x throughput, removes 41%-43% of backend
+dispatches, and prevents short requests from waiting behind long singletons.
+The balanced mix consistently reduced dispatches but throughput followed test
+order, so it is treated as latency/efficiency evidence rather than a stable
+throughput gain. Uniform T=1 executes the identical single backend batch, and
+uniform T=32 remained throughput-neutral. CPU mixed throughput followed
+thermal/order noise while batch count and median latency improved; uniform CPU
+runs showed no stable regression. Lookahead is enabled by default and strict
+FIFO remains available with `EI_BATCH_LOOKAHEAD=0`.
+
+Raw results:
+
+- `perf/results/2026-07-19/151552-cpu-dimensions/`
+- `perf/results/2026-07-19/151602-metal-dimensions/`
+- `perf/results/2026-07-19/152746-infinity-fifo-a/`
+- `perf/results/2026-07-19/152747-infinity-lookahead-a/`
+- `perf/results/2026-07-19/152748-infinity-lookahead-b/`
+- `perf/results/2026-07-19/152749-infinity-fifo-b/`
+
+### Rejected And Deferred Ideas
+
+- Infinity's three-stage pipeline is already represented by persistent HTTP and
+  tokenizer workers feeding the single backend owner; backend flattening and
+  result fanout are small, bounded operations.
+- Length sorting is useful for padded transformer batches. This runtime does not
+  pad, so only bounded fit-aware selection was retained.
+- The experimental disk cache adds serialization and storage latency to a hot
+  path already served by an exact token-ID memory cache and duplicate
+  singleflight. It may be reconsidered only for restart-heavy deployments.
+- Multiple replicas improve multi-device deployments. Infinity itself treats
+  CPU replication as a debugging option; one CPU, Metal, or CUDA device should keep a
+  single workspace owner.
+- Production-shape warmup was already tested and rejected because real startup
+  inference did not improve first HTTP latency. Allocation reservation remains.
+- Quantized/binary response formats change retrieval quality and require a
+  calibration and recall evaluation, so they are not transport optimizations.
+- CUDA graph capture is now retained in the CUDA backend below. Revisit an
+  equivalent graph/update mechanism for ROCm; Metal has no direct equivalent.
+
+## 2026-07-19: Persistent HTTP And Adaptive Collection
+
+Status: retained for CPU and Metal.
+
+HTTP/1.1 connections now remain persistent unless the client requests close.
+Worker ownership is bounded to half the HTTP pool by default, each connection
+has a 100-request limit and 1000 ms idle timeout, and pipelined bytes survive
+between requests. This leaves workers available to accept new connections.
+`EI_HTTP_KEEPALIVE=0` restores one response per connection.
+
+Paired cached-response measurements at concurrency 32:
+
+| backend | format | keep-alive off req/s | on req/s | x throughput |
+|---|---|---:|---:|---:|
+| CPU | float | 7916-7955 | 10264-10581 | 1.29-1.33x |
+| CPU | base64 | 9026-9167 | 11576-13621 | 1.26-1.51x |
+| Metal | float | 7508-7784 | 10615-10621 | 1.36-1.41x |
+| Metal | base64 | 8210-9108 | 15161-15206 | 1.66-1.85x |
+
+The scheduler now skips the fixed 200 us collection wait for an isolated
+synchronous request, while retaining it when the queue overlaps or recently
+batched. `EI_ADAPTIVE_BATCH_WAIT=0` restores fixed waiting. T=1 latency changed
+from 2.04-3.09 ms to 1.75-1.77 ms on Metal and 2.49-3.12 ms to 2.21-2.26 ms on
+CPU. Saturated and mixed workloads retained the same batch behavior and showed
+no stable throughput regression.
+
+Raw results include:
+
+- `perf/results/2026-07-19/170225-keepalive-a-metal-off/`
+- `perf/results/2026-07-19/170225-keepalive-a-metal-on/`
+- `perf/results/2026-07-19/170235-keepalive-a-cpu-off/`
+- `perf/results/2026-07-19/170236-keepalive-a-cpu-on/`
+
+## 2026-07-19: Exact Float Response Cache
+
+Status: retained with a 64 MiB default capacity.
+
+The server now has a byte-bounded, mutex-protected LRU keyed by exact request
+body bytes. It stores only successful `encoding_format="float"` JSON bodies.
+Base64 responses bypass it because their existing formatting path is already
+cheap, and failures are never cached. Entries use exact length and byte
+comparison after a 64-bit hash; reference counts prevent eviction while a
+worker sends a cached body. `--response-cache-mb 0` disables the cache.
+
+With keep-alive enabled, a repeated float response measured:
+
+| backend | operation | cache off | cache on | result |
+|---|---|---:|---:|---:|
+| CPU | cached single | 0.180-0.190 ms | 0.063-0.089 ms | 2.1-3.0x |
+| CPU | cached batch 32 | 2.606-2.628 ms | 0.090-0.128 ms | 20-29x |
+| CPU | concurrency 32 | 9712-9906 req/s | 12942-12956 req/s | 1.31-1.33x |
+| Metal | cached single | 0.185-0.205 ms | 0.066-0.068 ms | 2.7-3.1x |
+| Metal | cached batch 32 | 2.619-2.698 ms | 0.091 ms | 29-30x |
+| Metal | concurrency 32 | 9202-9734 req/s | 12550-12622 req/s | 1.29-1.37x |
+
+Unique misses remained flat: roughly 29.7-30.1 ms on CPU and 4.1-4.7 ms on
+Metal. The canonical token-ID embedding cache remains separate and reusable
+across dimensions and formats.
+
+Raw results include:
+
+- `perf/results/2026-07-19/180515-float-cache-final-a-metal-on-cache0/`
+- `perf/results/2026-07-19/180516-float-cache-final-a-metal-on-cache64/`
+- `perf/results/2026-07-19/180517-float-cache-final-a-cpu-on-cache0/`
+- `perf/results/2026-07-19/180518-float-cache-final-a-cpu-on-cache64/`
+
+## 2026-07-19: FP16 K/V And Projection Width Follow-Up
+
+Status: retained FP16 K/V for long Metal sequences; wider CPU and Metal
+projection groups rejected.
+
+Metal attention now stores K/V as FP16 when the longest sequence in the batch
+is at least 1024 tokens. Q remains FP32, and score, online softmax, and value
+accumulation remain FP32. The retained path writes V as FP16 from the R4 QKV
+projection and K as FP16 from fused norm/RoPE, avoiding a conversion dispatch.
+`EI_METAL_FP16_KV_MIN_TOKENS=65536` restores FP32-only diagnostics.
+
+Two-engine alternating A/B measurements controlled temperature within each
+iteration:
+
+| tokens | FP16 K/V ms | FP32 K/V ms | x throughput | cosine |
+|---:|---:|---:|---:|---:|
+| 1024 | 104.97-112.79 | 107.89-116.25 | 1.028-1.031x | 0.999999945 |
+| 2048 | 232.53-240.14 | 254.55-257.85 | 1.074-1.095x | 0.999999970 |
+
+The permanent parity test measures FP32/FP16 cosine 0.999999940 at both 1024
+and 2048. Packed 2048-token A/B results were 1.071x at batch 1, 1.051x at batch
+2, and 1.124x at batch 4. Forced FP16 was neutral for packed 32-token batches
+from B=2 through B=32 but regressed a lone short request, so production routes
+by maximum sequence length rather than flattened total tokens.
+
+Rejected experiments:
+
+- Metal R8 was about 8% slower at T=7 and neutral at medium lengths. R16 was
+  20-29% slower at short lengths. Neither produced a stable long-shape gain, so
+  only R4 is compiled into the production metallib.
+- AArch64 CPU batch-8 weight reuse had identical checksums, but one T=2048 pair
+  was 3% slower and its reverse was 9% faster. The midpoint was only about 3%
+  and followed thermal order, so the retained CPU micro-GEMM remains batch 4.
+
+Raw whole-run Metal results include:
+
+- `perf/results/2026-07-19/181542-fp16-kv-a-f32/`
+- `perf/results/2026-07-19/181546-fp16-kv-a-f16/`
+- `perf/results/2026-07-19/181940-fp16-kv-direct-a-f32/`
+- `perf/results/2026-07-19/181946-fp16-kv-direct-a-f16/`
+
+The final engine and packed-batch comparisons used the alternating native A/B
+harnesses; their JSON output is summarized above.
+
+## 2026-07-19 to 2026-07-20: CUDA SM86 Backend
+
+Status: retained and validated on one RTX 3090 (SM86), CUDA
+12.9, driver 580.65.06.
+
+References inspected:
+
+- `llama.cpp/ggml/src/ggml-cuda/dequantize.cuh`, `vecdotq.cuh`, and
+  `fattn-wmma-f16.cu`: exact Q4_0 packing, integer dot products, and FP16
+  attention tiling.
+- `QuixiCore-CUDA/kernels/quant/qgemv.cu`, `qgemm.cu`, and `tm_qmm.cuh`:
+  warp scheduling, zero-shuffle Q4 fragment loading, and
+  `mma.sync.m16n8k16` accumulator layout.
+- `QuixiCore-CUDA/perf/perf.md`: correctness-first alternating A/B runs,
+  realistic whole-model shapes, and a 3% retention threshold.
+- Metal and CPU routes in this repository: packed block-diagonal attention,
+  fused Q/K norm plus RoPE, multirow activation reuse, and final pooling.
+- `.reference/vllm`: repeated-shape CUDA graph replay and token-budget batching.
+
+### Optimization Passes
+
+1. The initial complete backend used direct packed-Q4 FP32 warp projections and
+   online FP32 attention. It established the functional baseline shown below.
+2. The T=1..4 path fused RMS norm with per-32-value Q8 quantization and used
+   Q4 x Q8 `dp4a` projections. At T=4 this reduced 2.882 ms to 1.997 ms,
+   1.443x throughput; T=1 remained neutral. `EI_CUDA_Q8_LATENCY=0` retains the
+   FP32 path for A/B.
+3. The tensor route combined Q/K/V into one 1280-row GEMM and up/gate into one
+   2304-row GEMM. Residual addition, next RMS norm, and FP16 conversion were
+   fused. T=7 reached 1.92 ms and T=32 2.73 ms before attention tuning.
+4. FP16 online attention, an eight-query shared-tile Flash-style kernel, and
+   dense tensor-core QK/PV plus custom FP32 softmax were implemented. Initial
+   single-sequence sweeps put their noisy crossover between 40 and 80 tokens.
+   Tensor attention reduced 512 from
+   10.96 to 4.96 ms, 1024 from 21.05 to 9.64 ms, and 2048 from 51.56 to
+   22.99 ms, all about 2.2x throughput. Online/tensor output cosine is at least
+   `0.999997914` through 2048 tokens.
+5. Native packed-Q4 MMA dequantizes GGML blocks directly into
+   `mma.sync.m16n8k16` fragments for every model projection. It matches the
+   expanded-FP16 route at minimum cosine `0.999983191`, but direct global
+   fragment dequantization is 3.2x-4.3x slower on RTX 3090. It remains available
+   with `EI_CUDA_NATIVE_Q4_GEMM=1` as a low-memory diagnostic.
+6. Packed attention exposed a batch-dependent crossover because dense QK/PV
+   launches per sequence. Production now classifies each sequence separately:
+   tensor thresholds are 80 tokens at batch 1, 128 at batches 2..4, and 192 for
+   larger batches; shorter sequences use Flash in the same forward pass. This
+   retained the single-sequence tensor gains while improving representative
+   packed shapes to 2,030 req/s at T64/B32, 878 at T96/B4, and 819 at T128/B16.
+   T192/B32 remains tensor-routed and reaches 632 req/s. Setting
+   `EI_CUDA_TENSOR_ATTENTION_MIN_TOKENS` disables this heuristic for exact A/B.
+
+Production implementation:
+
+- One CUDA copy of the GGUF data section, plus one load-time FP16 expansion of
+  the 168 projection matrices for the retained cuBLAS path.
+- Model-specialized RMS norm, residual/next norm, Q/K norm plus NEOX RoPE,
+  full and symmetric-SWA GQA masks, and final norm/mean/L2 pooling.
+- Q8/DP4A projections below five flattened tokens; combined FP16 tensor-core
+  projection GEMMs with FP32 accumulation from five tokens upward. The combined
+  QKV epilogue writes normalized and RoPE-transformed Q/K plus V directly to
+  FP16 attention buffers.
+- FP16 Q/K/V attention with FP32 softmax and output: per-sequence shared-tile
+  Flash or dense tensor-core QK/PV selected by the batch-tuned thresholds.
+- A 16-shape CUDA graph cache keyed by flattened token count, batch size, and
+  packed offset hash. Workspace growth invalidates pointer-bearing graphs.
+
+End-to-end improvement on the same GPU:
+
+| tokens | initial direct-Q4 ms | retained ms | x throughput | retained tok/s |
+|---:|---:|---:|---:|---:|
+| 1 | 2.027 | 1.712 | 1.184x | 584 |
+| 7 | 4.595 | 1.888 | 2.434x | 3,707 |
+| 32 | 15.086 | 2.303 | 6.551x | 13,897 |
+| 128 | 48.007 | 2.491 | 19.274x | 51,389 |
+| 512 | 189.083 | 4.788 | 39.490x | 106,932 |
+| 2048 | 762.588 | 19.931 | 38.261x | 102,755 |
+
+For unique 32-token requests, the final dynamic service scales from 417 req/s
+at concurrency 1 to 3,279 req/s at concurrency 32. Direct packed execution
+reaches 4,740 req/s at batch 32 with minimum packed/serialized cosine
+`0.999785721`. Full-context requests remain singleton batches; the final engine
+rate is 50.2 req/s. The 512-token packing cutoff is retained to avoid
+multiplying latency for full-context requests.
+
+Correctness and safety:
+
+- All 10 llama.cpp goldens pass; retained minimum cosine is `0.999910414`.
+- CPU/CUDA synthetic drift passes at 1/7/32/128 tokens; minimum is
+  `0.991125166` on arbitrary token IDs.
+- Packed-vs-single route drift passes at minimum cosine `0.998983860`; this is
+  the one-token Q8/DP4A route crossing to FP16 GEMM in a packed batch.
+- Q8/DP4A versus FP32 latency-route cosine is at least `0.996344924`.
+- Online/tensor attention and expanded/native-Q4 MMA have permanent parity
+  coverage. Direct-FP16 QKV split/epilogue parity is exactly `1.000000000` at
+  7, 128, and 2048 tokens. HTTP Matryoshka dimensions pass on CUDA.
+- Compute Sanitizer memcheck reports zero errors on Q8, Flash, tensor-attention,
+  direct-FP16 QKV, banded SWA, and native packed-Q4 MMA shapes.
+- The specialized server was launched without `--backend cuda` and reported the
+  CUDA backend, confirming binary-specific default selection.
+
+Raw remote results:
+
+- `/tmp/embeddinggemma.c-cuda-dev/perf/results/2026-07-19/234250-cuda-initial/`
+- `/tmp/embeddinggemma.c-cuda-dev/perf/results/2026-07-19/234821-cuda-graphs/`
+- `/tmp/embeddinggemma.c-cuda-dev/perf/results/2026-07-20/004704-cuda-kernels-final/`
+- `/tmp/embeddinggemma.c-cuda-dev/perf/results/2026-07-20/004705-cuda-kernels-final-t32/`
+- `/tmp/embeddinggemma.c-cuda-dev/perf/results/2026-07-20/004711-cuda-kernels-final-t2048/`
+
+### Cross-Backend Passes
+
+7. CUDA symmetric-SWA tensor attention now submits rectangular QK/PV GEMMs
+   over 1024-query bands instead of materializing the full 2048 x 2048 score
+   matrix. It retained output cosine `0.999999762` and reduced T=2048 from
+   about 22.93 ms to 21.08-21.15 ms (`1.084x-1.088x` throughput). Banded T=1024
+   regressed about 4.3%, so production starts the route at 1536 tokens.
+8. Metal residual addition and the following RMS norm were fused into one
+   dispatch, carrying normalized activations directly to the next projection.
+   Alternating A/B runs measured `1.09x-1.12x` at T=1, about `1.09x` at T=7,
+   `1.04x-1.05x` at T=32, and `1.02x-1.045x` at T=128. Longer shapes were
+   neutral, so production limits this fusion to 128 tokens.
+9. CUDA combined QKV projection now normalizes Q/K, applies RoPE, and writes
+   Q/K/V directly to FP16 attention buffers without intermediate split and
+   conversion kernels. Checksums remained identical. Reversed-order runs
+   measured `1.07x-1.14x` at T=7..128, `1.03x` at T=512, and about `1.05x` at
+   T=2048, so the route is retained. A second experiment wrote attention
+   context directly to the FP16 projection input; it was only `1.006x` at
+   short shapes and `1.013x-1.018x` at T=512..2048. It remains available with
+   `EI_CUDA_DIRECT_FP16_CONTEXT=1` but is disabled by default because it did
+   not meet the 3% retention threshold.
+10. A CPU 3:1-GQA attention experiment computed all three query heads together
+    and shared each K/V load. It passed kernel, golden, and packed-batch parity,
+    but extra live accumulators and output streams increased pressure on the M5
+    Max cores. The first paired run regressed T=7..2048 by roughly 8%-15%; the
+    reversed thermal order still favored the existing head-at-a-time kernel.
+    The experiment was removed.
+11. A Metal multi-simdgroup attention experiment adapted QuixiCore-Metal's
+    four-simdgroup K/V staging geometry to this model's D=256 head. Four query
+    simdgroups shared 8-token FP16 K/V tiles with FP32 online softmax. Outputs
+    had identical benchmark checksums, but the extra barriers, threadgroup
+    traffic, and occupancy cost reduced throughput to about `0.91x` at T=1024
+    and `0.86x` at T=2048 in the first pair; reversed order remained slower.
+    The experiment was removed, confirming the existing cache-fed one-simdgroup
+    kernel is better on M5 Max.
+12. A CUDA T=2..4 DP4A experiment assigned one warp to each output row and
+    accumulated four activation rows while reusing packed Q4 blocks. It covered
+    QKV, attention output, up/gate, and down projections and passed the CUDA
+    suite with identical benchmark checksums. After normalizing each run to the
+    unchanged T=1 control, however, it was about 1%-2% slower at T=2..4. The
+    apparent first-run T=2 gain tracked GPU clock state and disappeared in
+    reversed order. The kernels were removed.
+
+The last three independent optimization passes produced no significant gain,
+so this loop stops here per the handbook criterion. The retained results from
+this loop are CUDA banded SWA tensor attention, Metal short-shape residual/next
+norm fusion, and CUDA direct-FP16 QKV epilogues.
+
+## 2026-07-20: XPU SYCL Functional Baseline
+
+Status: baseline recorded; optimization passes in progress.
+
+Environment: one Intel Arc Pro B60 selected from a two-B60 host, oneAPI 2026.1,
+Level Zero 1.14.37020, immediate command lists, mixed-FP16 oneMKL GEMM, and a
+resident unrelated two-GPU vLLM workload. Absolute timings therefore include
+some external contention; route decisions use reversed-order A/B runs.
+
+Current implementation: persistent device model/workspace allocations, native
+Q8 embedding decode, subgroup norms and online attention, direct packed-Q4
+projection diagnostics, load-time FP16 expansion of all projection matrices,
+combined QKV and up/gate oneMKL GEMMs, fused QKV norm/RoPE/V epilogue, fused
+residual/next norm, and dense oneMKL QK/PV attention from 128 tokens.
+
+References inspected:
+
+- `QuixiCore-XPU/kernels/quantization/gguf_gemv`
+- `QuixiCore-XPU/kernels/norms/rms_norm`
+- `QuixiCore-XPU/kernels/attention/attention`
+- `vllm-xpu-kernels/csrc/xpu/sycl/decode`
+- `vllm-xpu-kernels/csrc/xpu/attn/xe_2`
+- `vllm-xpu-kernels/csrc/xpu/grouped_gemm`
+
+Correctness: all 10 llama.cpp goldens pass at minimum cosine `0.999910653`.
+CPU/XPU synthetic drift is at least `0.996121168`; direct packed-Q4 versus
+expanded-FP16 projection is at least `0.999994934`; online versus tensor
+attention is at least `0.999997437`; packed versus serialized execution is at
+least `0.999954283`; HTTP Matryoshka dimensions pass.
+
+Retained whole-engine baseline, five warmups and 20 iterations:
+
+| tokens | median ms | tokens/s |
+|---:|---:|---:|
+| 1 | 4.6694 | 214.2 |
+| 7 | 4.7763 | 1,465.6 |
+| 32 | 7.6252 | 4,196.6 |
+| 128 | 9.9928 | 12,809.3 |
+| 512 | 20.3124 | 25,206.3 |
+| 2048 | 67.5650 | 30,311.5 |
+
+Dynamic unique T32 requests scale from `135.067 req/s` at concurrency 1 to
+`880.631 req/s` at concurrency 32 (`6.52x`, 28,180 input tokens/s, average
+batch 32). A forced collection delay was rejected: it reduced concurrency-32
+throughput while increasing single-request latency.
+
+Attention crossover experiments show that a scalar threshold is insufficient.
+Tensor attention wins for one sequence from about T80, but per-sequence GEMM
+submissions make it 1.48x slower at T128/B4 and 2.50x slower at T128/B16.
+Tensor wins again at T256/B4 and T512/B2. This motivates grouped GEMM and a
+batch-aware route before final threshold tuning.
+
+Rejected experiment: SYCL command-graph capture including oneMKL was neutral at
+T1 and 15-25% slower from T7 through T2048 than immediate in-order submission,
+so it was removed.
+
+Raw results:
+
+- Remote `perf/results/2026-07-20/014007-xpu-retained/`
+- Remote `perf/results/2026-07-20/014033-xpu-t32-retained/`
+- Focused reversed-order attention and packed-route command output.
+
+### XPU Pass 1: Event Profiling
+
+Status: retained as an opt-in diagnostic; no measurable disabled-path cost.
+
+`EI_XPU_PROFILE=1` now creates a profiling-enabled Level Zero queue and reports
+per-label SYCL event totals for copies, kernels, and oneMKL calls. With profiling
+disabled, a five-warmup/20-iteration check measured 4.645 ms at T1, 7.355 ms at
+T32, 18.751 ms at T512, and 69.378 ms at T2048, within the variance of the
+functional baseline.
+
+The device-event breakdown changed the optimization order. At T1, the 47 fused
+residual/next-normalization calls total about 1.31 ms. At T512, dense QK,
+softmax, and PV total about 3.00 ms while pooling plus its result transfer total
+about 1.02 ms. At T2048, QK/softmax/PV total about 35.9 ms, pooling plus result
+transfer about 6.64 ms, and the four projection classes about 6.88 ms. Event
+profiling changes queue behavior and clock state, so these values rank work but
+are not used as end-to-end speedup claims.
+
+### XPU Pass 2: Grouped oneMKL Dense Attention
+
+Status: rejected.
+
+The dense route was changed from six oneMKL calls per sequence and layer to one
+grouped QK call, one batch-wide softmax dispatch, and one grouped PV call. Score
+matrices were packed by sequence, and all grouped descriptor and pointer arrays
+were kept alive until the queue completed to satisfy asynchronous lifetime
+requirements. The implementation compiled, but a forced dense T128 run did not
+complete a single measured iteration within 60 seconds; the retained path is
+about 10 ms end to end. The same timeout occurred before and after correcting
+descriptor lifetime. oneMKL 2026.1 grouped GEMM is therefore unusable for this
+small heterogeneous three-head geometry on the tested Level Zero stack. The
+experiment was removed; a custom fused attention kernel remains the viable way
+to eliminate these submissions.
+
+### XPU Pass 3: FP16 Q/K/V Attention Storage
+
+Status: retained for dense-attention sequences; rejected for unconditional
+online attention.
+
+The combined QKV epilogue can now write Q/K/V directly to FP16. Online
+attention converts loads to FP32 and keeps FP32 softmax/output accumulators;
+dense attention uses mixed FP16 QK with FP32 scores, writes normalized
+probabilities to FP16, and uses mixed FP16 PV with FP32 output. Forced-route
+cosine versus the FP32 path is at least `0.999989022` over T1..T2048.
+
+Alternating single-request A/B measured `1.0566x` at T128, `1.2771x` at T512,
+and `1.4645x` at T2048. Packed dense T128 measured `1.0796x`, `1.0592x`, and
+`1.1008x` at batches 4, 8, and 16. Unconditionally storing FP16 for short
+online-attention batches was noisy and often slower (as low as `0.739x` in a
+contended T32/B4 run), so production uses FP16 only when every sequence in the
+batch takes the dense route. `EI_XPU_FP16_ATTENTION=0|1|auto` preserves exact
+off, forced-on, and production A/B modes.
+
+### XPU Pass 4: Batch-Aware Attention Routing
+
+Status: retained.
+
+The scalar T128 dense-attention threshold was replaced by batch-aware defaults:
+T80 for one sequence, T192 for batches 2..4, T384 for batches 5..8, and T512
+for larger batches. Setting `EI_XPU_TENSOR_ATTENTION_MIN_TOKENS` still forces an
+exact scalar threshold for diagnostics. Paired in-process A/B against the old
+T128 rule measured `1.204x`, `1.318x`, and `1.523x` at T128/B4, B8, and B16.
+At T256 it measured `1.256x` at B8 and `1.461x` at B16. T192/B4 moved slightly
+in favor of dense attention after FP16 Q/K/V landed, which set the final B2..4
+crossover to T192. Route cosine remained at least `0.999981582` for the retained
+benchmark shapes.
+
+### XPU Pass 5: Banded Symmetric-SWA GEMMs
+
+Status: implemented as a diagnostic and disabled by default.
+
+Long sliding-window layers can partition queries into compact bands, compute
+only the corresponding key range, apply exact edge masks, and feed FP16
+probabilities to PV. A 1024-query tile preserved cosine `0.999999678` or better,
+but measured `0.959x` at T1024, `0.955x` at T1536, and only `1.019x` at T2048.
+Tiles of 512 and 256 were slower (`0.925x` and `0.660x` at T2048) because extra
+oneMKL submissions outweighed reduced FLOPs. Production leaves the tile at zero;
+`EI_XPU_SWA_TENSOR_TILE_TOKENS` and `EI_XPU_SWA_TENSOR_MIN_TOKENS` retain the
+complete experiment for future oneMKL/driver retesting.
+
+### XPU Pass 6: Single-Token V-Only Attention
+
+Status: retained.
+
+For a one-token sequence, softmax attention is exactly its value vector for
+every query head. Batches containing only one-token sequences now project only
+the 256-row V slice of the combined QKV weights, replicate V directly into the
+FP16 attention-output input, and skip Q/K projection, Q/K norm, RoPE, and
+attention. Alternating packed A/B measured `1.820x`, `1.805x`, `1.824x`,
+`1.788x`, `1.789x`, and `1.800x` at batches 1, 2, 4, 8, 16, and 32. Minimum
+cosine was `0.999988914`. `EI_XPU_SINGLE_TOKEN_V_ONLY=0|1` controls the route.
+
+### XPU Pass 7: Cooperative RMS and Pooling
+
+Status: retained with shape routing.
+
+Rows up to four tokens now assign one 128-thread workgroup to each RMS row,
+including the fused residual/next-normalization kernel, instead of launching
+eight 16-thread subgroups with most inactive. This measured `1.612x` at T1,
+`1.234x` at T2, and `1.208x` at T4, then became neutral by T7. Cosine remained
+at least `0.999994620` over the routed shapes.
+
+Final norm/mean/L2 pooling now has a cooperative 128-thread implementation with
+six accumulators per lane instead of 48. It measured `1.030x` at T128, `1.048x`
+at T256, `1.022x` at T512, and `1.060x` at T2048, while T32 regressed `1.4%`.
+Production therefore selects it for one-token or at-least-128-token sequences.
+For packed mixed-length batches, auto mode uses the cooperative kernel only
+when every sequence qualifies; this keeps a short request's embedding
+independent of a long neighbor's pooling route.
+`EI_XPU_COOPERATIVE_RMS_MAX_ROWS=0..128` and
+`EI_XPU_COOPERATIVE_POOL=0|1|auto` preserve exact experiment controls.
+
+### XPU Pass 8: Xe2 XMX Flash Attention
+
+Status: retained for single sequences when built with `XPU_XE2_FLASH=1`;
+multi-sequence varlen dispatch remains forced-only for diagnostics.
+
+The Xe2 chunk-prefill kernel from `vllm-xpu-kernels` is instantiated only for
+EmbeddingGemma's FP16, head-256, three-query/one-KV-head geometry. The optional
+build now carries the same split-barrier, 2D-block-I/O, subgroup-matrix, BMG
+device-link, and 256-GRF settings as the reference build. Q/K/V are consumed
+directly from the fused FP16 QKV epilogue and the FP16 context is passed
+directly to the output projection, removing score-matrix storage and six
+oneMKL attention calls per layer.
+
+The initial asynchronous prototype measured `1.079x`, `1.105x`, `1.044x`, `1.233x`,
+`1.190x`, `1.337x`, and `1.550x` at T32, T64, T128, T256, T512, T1024, and
+T2048. Minimum single-sequence cosine was `0.999975628`. Absolute timing was
+heavily affected by a resident two-GPU workload, so only paired ratios are
+used. These values were superseded by the fenced production measurements in
+the final-validation section below.
+
+The imported multi-sequence varlen scheduler was faster through B16 in initial
+paired runs, but repeated identical T32/B16 runs produced nondeterministic
+minimum cosine from `0.998176754` to `0.999876857`. An explicit queue-completion
+fence did not eliminate the drift and imposed severe latency. Production auto
+mode is therefore restricted to batch size one; `EI_XPU_XE2_FLASH=1` can still
+force multi-sequence experiments, while `0` disables the route exactly.
+The imported launcher does not return an event that oneMKL can consume, so the
+retained path completes each Flash dispatch before submitting its output
+projection. Without that fence, a T129 Flash request changed later packed
+results. Automatic routing begins at T256: a final mixed serialized/packed
+regression
+showed that selecting Flash only for serialized T32 requests reduced route
+consistency to cosine `0.998735249`, while the T129 route remained above
+`0.999997`. T32-T255 results remain available through forced mode but are not
+used in production.
+
+### XPU Pass 9: Fixed-Shape oneDNN XMX Projections
+
+Status: rejected; optional experiment retained behind `XPU_ONEDNN=1` and
+`EI_XPU_ONEDNN_F16=1`.
+
+The four projection geometries now have cached oneDNN matmul primitives using
+FP16 inputs/weights, FP32 outputs, and a transposed-stride view of the existing
+expanded weights. This tests oneDNN's fixed-shape XMX dispatch against the
+retained oneMKL row-major GEMMs without changing model precision. Alternating
+A/B measured `0.960x`, `0.986x`, `0.986x`, `1.002x`, `1.013x`, `1.033x`,
+`1.007x`, and `1.003x` at T1, T7, T32, T64, T128, T256, T512, and T2048.
+Cosine was at least `0.999983099`. The isolated 3.3% T256 result was not broad
+or large enough to justify another runtime and primitive cache in production.
+
+### XPU Pass 10: oneDNN S4 Weight-Only Projections
+
+Status: implemented as an optional diagnostic; disabled by default.
+
+GGUF Q4_0 projection weights can now be repacked once into signed S4 `[K,N]`
+storage with FP16 `[K/32,N]` block scales. Cached oneDNN weight-only matmuls
+consume FP16 activations and produce FP32 outputs, reducing projection weight
+storage by 4x versus expanded FP16 while preserving cosine `0.999984499` or
+better over the measured shapes. A short seven-iteration sweep appeared to
+gain `1.145x` at T32 and `1.076x` at T128, but a four-warmup/21-iteration
+repeat measured only `0.928x` at T32, `0.921x` at T48, `0.942x` at T64, and
+`0.958x` at T128. The initial result was GPU clock/contention variance. The
+portable binary therefore does not link oneDNN or allocate repacked weights;
+`XPU_ONEDNN=1 EI_XPU_ONEDNN_W4=1` preserves the complete experiment.
+
+### XPU Pass 11: M-Tiled Native Q4 Projection
+
+Status: implemented as a diagnostic and disabled by default.
+
+For M2..M8, one subgroup now owns an output row, decodes each Q4_0 block once,
+and accumulates all request rows in registers. This removes redundant packed
+weight reads from the original token-major direct kernel. Alternating A/B
+against that kernel measured `1.134x`, `1.102x`, `1.152x`, and `1.151x` at M2,
+M4, M7, and M8 with cosine exactly `1.0`; M1 regressed to `0.934x`. Whole-engine
+latency remained 23.8-38.5 ms versus roughly 3.7-5.0 ms for the retained FP16
+oneMKL route, so `EI_XPU_Q4_M_TILED=1` is available only when direct Q4 is
+forced with `EI_XPU_GEMM_MIN_TOKENS`.
+
+### XPU Final Validation and Loop Stop
+
+The portable build passed the XPU regression suite with CPU/XPU cosine at least
+`0.996161699`, packed-Q4/FP16-GEMM cosine at least `0.999996305`, online/dense
+attention cosine at least `0.999998212`. Repeated packed-versus-serialized XPU
+runs varied with oneMKL's M-dependent FP16 reduction path but remained at least
+`0.999484062`; the enforced XPU gate is `0.999`, stricter than CUDA's `0.998`.
+The Xe2-enabled build passed the same suite at minima `0.996134818`, `0.999995351`,
+and `0.999998212` respectively. The complete local CPU suite also passed,
+including all ten llama.cpp goldens (minimum cosine `0.999860704`), kernel
+tests, packed batches, service/cache tests, and HTTP Matryoshka dimensions.
+The remote XPU host lacks the libcurl development headers. Removing the linked
+libcurl dependency allowed the complete XPU HTTP executable to build there; its
+HTTP Matryoshka dimensions suite passed. Model cache misses now invoke `curl`
+or `wget` through POSIX `posix_spawnp`, while an existing model requires neither
+command.
+
+A final fenced three-warmup/11-iteration Xe2 A/B repeat measured `0.974x`,
+`1.091x`, `1.183x`, `1.304x`, and `1.535x` at T128, T256, T512, T1024, and
+T2048, with cosine at least `0.999997071`. T128 is below the production
+crossover; the retained T256-and-up shapes have cosine at least `0.999997999`.
+
+The final dynamic T32 snapshot under the resident two-GPU vLLM workload was:
+
+| concurrency | requests/s | input tokens/s | average batch |
+|---:|---:|---:|---:|
+| 1 | 58.0 | 1,856 | 1.0 |
+| 2 | 28.4 | 908 | 1.0 |
+| 4 | 62.4 | 1,997 | 3.4 |
+| 8 | 93.1 | 2,979 | 7.1 |
+| 16 | 124.3 | 3,976 | 12.8 |
+| 32 | 158.2 | 5,062 | 21.3 |
+
+These absolute values are a final-state smoke measurement, not a baseline
+comparison, because the unrelated workload changed GPU occupancy and clocks.
+All improvement claims above use alternating in-process A/B measurements.
+
+Passes 9, 10, and 11 produced no significant retained end-to-end gain after
+the Xe2 Flash win in Pass 8. The optimization loop therefore stops after three
+consecutive non-significant production passes, as required by the experiment
+protocol.
+
+## XPU Perfection Loop (2026-07-20)
+
+### XPU Pass 12: Event-Ordered Xe2 Flash
+
+Status: retained.
+
+The imported CUTLASS-SYCL launcher returned no event even though its underlying
+`compat::experimental::launch` call does. A model-specific launcher now returns
+that event, and an explicit device-side queue barrier orders the following
+oneMKL projection. This removes the per-layer `wait_and_throw` host fence and
+also makes Flash device time visible to the profiler. The old fence remains
+available as `EI_XPU_XE2_FLASH_HOST_FENCE=1` for A/B diagnostics.
+
+After a contaminated first sweep was discarded, a five-warmup/21-iteration
+alternating in-process repeat measured `1.034x`, `1.022x`, `1.010x`, and
+`1.005x` at T256, T512, T1024, and T2048. Cosine versus the fenced path was at
+least `0.999997956`. The gain is concentrated at the production Flash
+crossover, but every retained shape was non-regressing. A profiled warm T512
+run reported 24 Flash calls totaling about `1.48 ms` and an end-to-end forward
+time of about `5.93 ms`.
+
+### XPU Pass 13: Exact-Shape SYCL Graph Replay
+
+Status: retained for all-single-token batches B1-B4; forced mode remains
+available for diagnostics.
+
+The B60 and its Level Zero driver expose `ext_oneapi_graph`. The engine now
+captures the complete fixed-shape forward submission, including oneMKL and
+CUTLASS kernels, into a bounded eight-entry LRU. IDs and sequence metadata are
+copied before replay, so graph entries depend only on sequence lengths and do
+not cache request data. Workspace growth clears captured graphs before device
+pointers move.
+
+Five-warmup/21-iteration alternating packed A/B at one token measured
+`1.246x`, `1.165x`, `1.110x`, `1.016x`, `1.017x`, and `1.020x` for B1, B2, B4,
+B8, B16, and B32. Minimum cosine was `0.999989212`. Single-request T7-T2048
+and packed T32 B1-B32 improved only 1.0%-2.6%. Production auto mode therefore
+captures only all-single-token batches through B4; `EI_XPU_COMMAND_GRAPH=1`
+forces any exact shape and `0` disables capture. Unsupported devices disable
+auto mode rather than failing initialization.
+
+### XPU Pass 14: Xe2 W4A16 DPAS Projections
+
+Status: retained only for the two-token up/gate projection; the general route
+is rejected.
+
+GGUF Q4_0 weights can now be repacked into the signed-int4 row-major layout
+consumed by `vllm-xpu-kernels`' BMG DPAS policies. An isolated matrix suite
+validates QKV, value, attention-output, fused up/gate, and down geometries at
+M1, M7, and M32 with cosine at least `0.999999975`. The loader waits for each
+host-to-device copy before releasing its temporary packing buffers.
+
+Using W4A16 for all four per-layer projections was slower than FP16 oneMKL:
+five-warmup/21-iteration A/B measured `0.782x` to `0.877x` from T1 through
+T128. At T32, W4 projection device time was about `197 us` higher and 96
+FP16-to-FP32 conversion launches added another `127 us`. Fused up/gate was the
+one favorable geometry, so its FP16 output now feeds GELU directly. A
+seven-warmup/31-iteration repeat measured `1.118x` for a single T2 sequence
+with cosine `0.999998120`. Command-graph replay made T1 and packed one-token
+B1-B2 effectively neutral (`1.006x` and `1.011x`), so production routes only
+the exact single-sequence T2 shape.
+
+### XPU Pass 15: Register-Cached Residual/RMS
+
+Status: retained on Xe2 for M2 and larger.
+
+The fused residual/update/next-RMS kernel now keeps each lane's updated
+residual values in registers across the second reduction, eliminating the
+final global residual read. The subgroup path uses 48 values per lane under
+the Xe2 build's 256-GRF setting; the cooperative M2-M4 path needs six. M1 keeps
+the prior cooperative kernel because register caching measured `0.989x` there.
+
+Five-warmup/21-iteration paired A/B measured `1.167x`, `1.164x`, `1.136x`,
+`1.117x`, `1.055x`, `1.086x`, `1.056x`, `1.081x`, and `1.079x` at T7, T16,
+T32, T64, T128, T256, T512, T1024, and T2048. Packed T32 measured `1.140x`,
+`1.139x`, `1.122x`, `1.081x`, `1.064x`, and `1.074x` at B1, B2, B4, B8,
+B16, and B32. Candidate/baseline cosine was at least `0.999979124` for single
+requests and `0.999384940` for packed requests. Caching projection values too
+was rejected: it measured only `1.000x-1.007x` on most shapes and `0.962x` at
+T128 because the additional 48 registers per lane offset the saved read.
+
+### XPU Pass 16: Stable Packed Xe2 Flash Routing
+
+Status: retained for packed batches whose shortest sequence is at least 128
+tokens.
+
+After the Flash launcher began returning an event, the varlen route was
+retested with true forced-mode semantics. The old A/B harness had still applied
+the 256-token auto threshold when `EI_XPU_XE2_FLASH=1`; forced mode now bypasses
+shape thresholds, while auto mode evaluates the shortest sequence in a batch.
+
+Actual Flash at T32 and T64 was faster but remained below the packed parity
+gate at larger batches, reaching repeated minima `0.999310672` and
+`0.999653101`. T128 was stable across three repeated sweeps and measured
+`1.84x-2.75x` at B2-B32. T256 measured `1.22x`, `1.38x`, `3.42x`, `4.39x`, and
+`4.37x` at B2, B4, B8, B16, and B32; T512 measured `1.28x-1.34x` at B2-B8.
+A 20-repeat mixed `[128,129,192,255]` regression had minimum cosine
+`0.999993384`, and `[256,257,384,511]` had minimum `0.999979794`. Auto mode
+therefore keeps the T256 single-sequence crossover and uses a conservative
+T128 minimum for packed batches.
+
+### XPU Pass 17: Runtime Gating and Reproducible Xe2 Build
+
+Status: retained.
+
+The Xe2 binary now queries oneAPI's architecture ID and enables BMG-only
+Flash, W4A16, and 256-GRF residual/RMS defaults only on
+`intel_gpu_bmg_g21`/`intel_gpu_bmg_g31`. Forced Flash or W4 on another
+architecture fails initialization instead of dispatching incompatible device
+code. Portable SYCL builds keep these routes disabled.
+
+`make xpu XPU_XE2_FLASH=1` now fetches public, pinned dependencies into
+`.xpu-deps`: `vllm-xpu-kernels` commit
+`bab46865358da4eda3b866c41dd71a80e878d843` and SYCL-TLA commit
+`cd763790ad2f74d7294435ecf77682bac0062c3a`. Explicit checkout overrides remain
+available. The model-specific Flash translation unit now includes the CUTLASS
+scheduler and kernel directly, avoiding unrelated Torch dtype/paged-cache host
+helpers and removing the PyTorch-header build dependency. A clean managed
+checkout compiled both Flash and W4 and passed the complete Xe2 suite.
+
+### XPU Final Validation
+
+The local CPU suite passed all kernel, tokenizer, service/cache, packed-batch,
+HTTP-dimension, and llama.cpp golden tests; golden minimum cosine was
+`0.999860704`. The Metal suite passed its 29 ready pipelines, goldens at
+minimum cosine `0.999910295`, packed parity `1.0`, and backend/KV/tile checks.
+
+The portable XPU build passed goldens at minimum cosine `0.999909997`,
+CPU/XPU drift at `0.996052265`, projection parity at `0.999995351`, attention
+parity at `0.999996066`, packed parity at `0.999976337`, and HTTP dimensions.
+The pinned Xe2 build passed goldens at `0.999910116`, CPU/XPU drift at
+`0.996102154`, the default T2 W4 route at `0.998495936` versus CPU, projection
+parity at `0.999995410`, attention parity at `0.999997139`, mixed Flash at
+`0.999994040`, boundary Flash at `0.999993622`, packed parity at `0.999941945`,
+HTTP dimensions, and every isolated W4 geometry at `0.999999975` or better.
+
+Final default B60 medians were 1.04 ms at T1, 1.23 ms at T2, 2.17 ms at T32,
+3.57 ms at T256, 5.64 ms at T512, 9.82 ms at T1024, and 20.54 ms at T2048.
+Packed B32 reached about 19,850 requests/s at T1, 109,170 tokens/s at T32, and
+135,860 tokens/s at T128. These are absolute final-state measurements; the
+per-pass claims above use alternating in-process A/B.
+
+## ROCm CDNA Backend and Optimization Loop (2026-07-20)
+
+Status: retained and validated on `enc1-svr04`, one AMD Instinct MI300X
+(`gfx942`), ROCm 7.2.4. Runtime testing used one MI300X, but the production
+binary is not `gfx942`-specific: one `hipcc` link embeds `gfx908`, `gfx90a`,
+`gfx942`, and `gfx950` code objects for CDNA1 through CDNA4. `roc-obj-ls`
+confirmed all four images in `build/embeddinggemma-rocm`. `ROCM_ARCHS` and the
+legacy `ROCM_ARCH` remain developer-only size/profiling overrides.
+
+The implementation was read against llama.cpp and
+`QuixiCore/QuixiCore-ROCm`. The retained design follows QuixiCore's CDNA
+principles: wave64-aware layout, logical width-32 reductions where the model
+shape requires them, `__builtin_amdgcn_sdot4` packed dot products, native
+`__builtin_amdgcn_mfma_f32_16x16x16f16` tiles, resident weights/workspaces,
+fused epilogues, correctness-gated alternating A/B runs, and measured routing
+instead of architecture-name assumptions.
+
+### Functional Baseline
+
+The first complete backend kept the GGUF data resident, expanded projection
+weights to FP16 once for hipBLAS, and provided direct packed-Q4, Q8/SDOT4,
+native Q4/MFMA, online/Flash-style attention, tensor attention, pooling, batch,
+and HTTP paths. The ROCm binary selects ROCm by construction; `--backend rocm`
+is unnecessary outside diagnostic harnesses.
+
+Initial warmed medians were 2.234 ms at T1, 6.195 ms at T7, 6.688 ms at T32,
+10.146 ms at T128, 9.404 ms at T512, and 18.775 ms at T2048. Initial dynamic
+T32 throughput at C1/C2/C4/C8/C16/C32 was 148/150/422/612/1,677/2,495 req/s.
+
+### ROCm Pass 1: HIP Command Graphs
+
+Status: rejected by default; retained as `EI_ROCM_COMMAND_GRAPH=1`.
+
+The first A/B measured `0.963x` at T1 and neutral results at larger shapes.
+After all later kernel changes, a 101-iteration repeat measured `1.021x` at T1,
+`1.001x` at T2, `0.940x` at T4, `1.000x` at T8, and `0.978x` at T16. The gain
+was neither stable nor shape-safe.
+
+### ROCm Pass 2: Direct FP16 Context
+
+Status: retained as `EI_ROCM_DIRECT_FP16_CONTEXT=1`.
+
+Writing attention output directly to the next projection's FP16 input removed
+one context conversion and measured `1.176x` at T128, `1.186x` at T512, and
+`1.433x` at T2048.
+
+### ROCm Pass 3: Attention Routing
+
+Status: retained, then superseded by the batched-head retune below.
+
+The original tensor route lost below 256 tokens, then measured `1.039x` at T256
+and `1.184x` at T512. The initial threshold moved from the inherited 80 tokens
+to 256. The QuixiCore BQ16 MFMA attention adaptation passed tails at
+16/33/128/191 tokens but measured only `0.98x` at T16, `0.96x` at T32,
+`0.94x` at T64/T128, and `0.914x` at T255, so
+`EI_ROCM_MFMA_ATTENTION` remains off.
+
+### ROCm Pass 4: Short-Shape Q8/SDOT4
+
+Status: rejected; retained under `EI_ROCM_Q8_LATENCY` and
+`EI_ROCM_Q8_TWO_ROW`.
+
+Runtime Q8 activation quantization plus SDOT4 measured `0.821x` versus direct
+FP32 packed-Q4 at T1/T2. A two-output-row QuixiCore-style kernel was exact and
+up to `1.034x` faster than the one-row Q8 kernel, but did not recover the Q8
+route's end-to-end loss.
+
+### ROCm Pass 5: Native Packed-Q4 MFMA
+
+Status: retained for 32-368 flattened tokens.
+
+The first native Q4 MFMA projection beat expanded-FP16 hipBLAS by `1.177x` at
+T128 but was neutral by T256 before launch fusion. Combining Q/K/V into one
+launch and up/gate into one launch improved the native route by `1.215x` at
+T128, `1.182x` at T160, `1.142x` at T192, and `1.107x` at T240. The final
+lower-bound retune measured native MFMA at `1.146x` at T48, `1.261x` at T64,
+`1.368x` at T80, `1.679x` at T96, and `1.867x` at T120 versus the direct packed
+path; it still lost below 32. The final upper-bound comparison against hipBLAS
+was `1.095x` at T320, `1.067x` at T352, `1.046x` at T368, `1.027x` at T384,
+and `0.971x` at T416.
+
+A wider-N QuixiCore MFMA variant reached `1.083x` versus the one-output-tile
+native kernel at T768, but native Q4 remained slower than hipBLAS at those
+large M values. `EI_ROCM_NATIVE_Q4_WIDE` is therefore diagnostic-only.
+
+### ROCm Pass 6: Register-Cached Residual/RMS
+
+Status: retained as `EI_ROCM_RMS_REGISTER_CACHE=1`.
+
+Each logical lane keeps 24 residual values in registers across the next RMS
+reduction. Alternating A/B measured `1.074x` at T128, `1.038x` at T192,
+`1.053x` at T256, `1.048x` at T352, `1.037x` at T512, `1.034x` at T1024, and
+`1.018x` at T2048, with cosine at least `0.999997146`.
+
+### ROCm Pass 7: Native Direct QKV
+
+Status: rejected; retained as `EI_ROCM_NATIVE_Q4_DIRECT_FP16_QKV=1`.
+
+One kernel fused separate native-Q4 Q/K normalization, RoPE, V conversion, and
+FP16 output. The first sweep ranged from `0.988x` to `1.010x`. Against the final
+route it remained `0.997x-1.008x` at T96-T368, so the extra path is disabled.
+
+### ROCm Pass 8: Dense SWA at 2K
+
+Status: retained with `EI_ROCM_SWA_TENSOR_TILE_TOKENS=0`.
+
+At T1536/T2048, full-query dense tensor attention measured 9.837/11.639 ms.
+Query tiles of 128, 256, 512, and 1024 measured 33.356/42.686,
+17.259/21.997, 12.549/15.465, and 11.298/12.733 ms respectively. On MI300X,
+the extra rectangular GEMMs cost more than computing masked dense scores, so
+zero tiling provides `1.149x` at T1536 and `1.094x` at T2048 versus the prior
+1024-query default.
+
+### ROCm Pass 9: Batched GQA Heads
+
+Status: retained as `EI_ROCM_BATCHED_TENSOR_ATTENTION=1`.
+
+Because EmbeddingGemma shares one K/V head across three query heads, tensor
+attention now uses two `hipblasGemmStridedBatchedEx` calls per sequence rather
+than six per-head calls. A head-aware softmax spans separate score/probability
+matrices. Candidate/baseline cosine was exactly 1 in the A/B sweep; throughput
+improved `1.208x` at T256, `1.146x` at T512, `1.163x` at T1024, `1.170x` at
+T1536, and `1.171x` at T2048.
+
+This changed the dense crossover. Batched tensor attention measured `0.972x`
+at T64, `1.014x` at T88, `1.047x` at T96, `1.336x` at T128, `1.418x` at T160,
+and `1.500x` at T192. Final automatic thresholds are 96 for one sequence, 128
+for two through four, and 192 for larger batches.
+
+### ROCm Pass 10: Fused MFMA FFN Activation
+
+Status: retained only from 320 through the native route's 368-token ceiling.
+
+One wave reuses each input fragment for up and gate MFMA, applies GELU, and
+writes FP16 directly into an existing scratch buffer. Reduced wave count hurt
+small shapes (`0.925x` at T32 and `0.942x` at T96), but sufficient high-end
+occupancy measured `1.039x` at T320, `1.039x` at T336, `1.030x` at T352, and
+`1.030x` at T368. Runtime routing keeps both geometries.
+
+### ROCm Pass 11: FP16 Tensor-Attention Scores
+
+Status: retained through 896 sequence tokens.
+
+hipBLAS still accumulates in FP32, while its score output and the following
+softmax input use FP16; softmax reductions remain FP32. This measured `1.168x`
+at T96, `1.164x` at T128, `1.068x` at T256, `1.036x` at T512, `1.059x` at
+T640, `1.053x` at T704, and `1.031x` at T896. It fell to `0.986x` at T1024,
+so larger sequences retain FP32 scores. Minimum output cosine was `0.9999905`.
+
+### ROCm Stop Passes
+
+Three consecutive final passes produced no significant general gain:
+
+1. A 128-thread tensor softmax measured `0.994x-1.003x` versus 256 threads.
+2. Native direct-FP16 QKV retesting measured at most `1.008x`.
+3. HIP graph retesting was shape-inconsistent and regressed T4 to `0.940x`.
+
+The loop stopped with the measured defaults rather than accumulating
+architecture-specific complexity without stable throughput.
+
+### ROCm Final Validation and Throughput
+
+The portable four-code-object build passed all llama.cpp goldens at minimum
+cosine `0.999910414`, CPU/ROCm synthetic drift at `0.991444767`, native MFMA
+projection parity at `0.999983668`, online/hipBLAS attention parity at
+`0.999992847`, scalar/MFMA attention parity at `0.999997556`, direct-QKV parity
+at `0.999999762`, packed parity at `0.999875247`, and HTTP Matryoshka tests.
+
+Final warmed medians were 1.773 ms at T1, 2.307 ms at T7, 3.598 ms at T32,
+3.412 ms at T96, 3.558 ms at T128, 4.788 ms at T256, 6.051 ms at T512,
+7.177 ms at T1024, 8.590 ms at T1536, and 9.945 ms at T2048. Relative to the
+functional baseline this is approximately `1.26x`, `2.69x`, `1.86x`, `2.85x`,
+`1.55x`, and `1.89x` at T1/T7/T32/T128/T512/T2048.
+
+At T32, packed B1/B2/B4/B8/B16/B32 reached 279/545/1,032/1,624/2,649/5,161
+req/s; B32 is 165,164 input tok/s and `18.65x` serialized throughput. The real
+dynamic service measured 273/279/686/990/1,284/3,507 req/s at concurrency
+1/2/4/8/16/32, with an average executed batch size of 25.6 at C32.
+
+## ROCm Cross-Backend Continuation Loop (2026-07-20)
+
+### ROCm Pass 18: Exact Single-Token V-Only Attention
+
+Status: retained as `EI_ROCM_SINGLE_TOKEN_V_ONLY=1`.
+
+The XPU route demonstrated that an independent one-token sequence does not need
+Q, K, RoPE, softmax, or an attention kernel: its attention output is exactly
+the shared V head repeated across all three query heads. ROCm now detects an
+all-singleton batch. Below the MFMA boundary, one packed-Q4 wave kernel projects
+V and writes all three FP32 heads directly. In the native range, one MFMA kernel
+projects V and writes repeated FP16 heads directly for the attention-output
+projection. The expanded-FP16 fallback uses a V-only hipBLAS projection.
+
+Fifteen-warmup/101-iteration single-engine A/B improved T1 from 1.768 to
+1.553 ms (`1.139x`) with cosine 1. T2 was unchanged (`1.004x`), confirming the
+shape guard. Seven-warmup/31-iteration packed A/B measured `1.145x`, `1.115x`,
+`1.080x`, `1.127x`, `1.173x`, `1.089x`, and `1.089x` at B1/B2/B4/B8/B16/B32/B64,
+all with exact parity. Candidate B64 reached 22,257 req/s.
+
+### ROCm Pass 19: Direct-Path Residual/Next-RMS Fusion
+
+Status: retained as `EI_ROCM_DIRECT_RMS_FUSION=1` below the 32-token native
+MFMA boundary.
+
+Metal's short-shape fusion and ROCm's own FP16 register-cached RMS showed that
+the direct FP32 route was paying avoidable launch and global-read costs. A new
+kernel computes post-projection RMS, updates the residual, computes the next
+RMS from 24 register-held values per logical lane, and writes the next FP32
+projection input. The next layer consumes that result directly, reducing the
+direct route from roughly four norm launches per layer to two.
+
+Nine-warmup/41-iteration alternating A/B measured `1.600x`, `1.523x`, `1.506x`,
+`1.438x`, `1.383x`, `1.291x`, and `1.281x` at T1/T2/T4/T8/T16/T24/T31. T32,
+which takes native MFMA and already had the FP16 fusion, remained neutral at
+`1.008x`. Minimum candidate/baseline cosine was `0.999999318`.
+
+### ROCm Pass 20: Direct Q4 Activation Reuse
+
+Status: retained as `EI_ROCM_DIRECT_Q4_PAIR=1` for 16-31 flattened tokens.
+
+CPU/Metal adjacent-row kernels suggested explicitly reusing each FP32
+activation load across two Q4 output rows. The direct QKV, V-only,
+attention-output, and FFN-down kernels now have paired-row variants; the fused
+up/gate kernel similarly reuses each activation load across both matrices.
+The row boundaries are architecture-neutral and do not depend on a specific
+CDNA target.
+
+Five-warmup/20-iteration alternating A/B measured `1.089x`, `1.077x`, and
+`1.085x` at T16/T24/T31 with cosine 1. Pairing was neutral at T4/T8 and reduced
+T1/T2 throughput to `0.967x`/`0.982x`, so runtime routing starts at 16 tokens
+and ends naturally at the 32-token native-MFMA boundary.
+
+### ROCm Pass 21: Fused Embedding and First RMS
+
+Status: marginal; retained as `EI_ROCM_FUSED_EMBEDDING_RMS=1` below 32 tokens.
+
+A register-cached kernel now dequantizes each Q8 embedding row, writes the
+residual stream, computes the first attention RMS, and emits the normalized
+FP32 projection input without a second global read or launch. A corresponding
+FP16 output was tested for MFMA/hipBLAS shapes but was not retained there.
+
+Seven-warmup/31-iteration alternating A/B measured `1.026x` at T1, `1.010x` at
+T8, `1.029x` at T16, and `1.027x` at T31. T32/T128/T512/T2048 ranged from
+`0.998x` to `1.018x`, so the route is limited to the direct path. Minimum
+direct-path cosine was `0.999999349`. This is insignificant pass 1 of 3 because
+no measured shape reached the 3% retention threshold.
+
+### ROCm Pass 22: Singleton Metadata Elision
+
+Status: retained as `EI_ROCM_SINGLETON_METADATA_ELISION=1`.
+
+The exact V-only path never consumes positions, sequence IDs, or flash/MFMA
+attention tile metadata, but the host still allocated, populated, and submitted
+eight small metadata transfers for every all-singleton batch. The batch planner
+now recognizes this shape before allocating those vectors and transfers only
+token IDs plus pooling offsets. Mixed and multi-token batches retain the full
+metadata path.
+
+Nine-warmup/51-iteration engine A/B improved T1 by `1.034x` with cosine 1.
+Packed singleton B1/B2/B4/B8/B16/B32/B64 improved by `1.028x`, `1.028x`,
+`1.031x`, `1.028x`, `1.053x`, `1.014x`, and `1.008x`; B64 reached 22,383
+req/s. The B16 and single-request gains exceed 3%, resetting the insignificant
+pass counter.
+
+### ROCm Pass 23: Direct Singleton Final Pool
+
+Status: retained as `EI_ROCM_FINAL_SINGLETON_POOL=1` on the direct path only.
+
+For independent one-token sequences, the final FFN residual update, output
+RMS, mean pool, and L2 normalization can be computed by one register-cached
+wave per request. The fused kernel avoids writing and rereading the final
+residual. It measured `1.012x`, `1.013x`, `1.010x`, `1.017x`, and `1.037x` at
+B1/B2/B4/B8/B16 with exact direct-path parity. A native-MFMA crossover test
+failed parity at B32 (`0.770338356`), so the guard explicitly excludes every
+GEMM/MFMA shape rather than relaxing correctness. This did not reset the stop
+counter because the broad gain was below 3%.
+
+### ROCm Pass 24: Singleton-Aware Projection Crossover
+
+Status: retained with direct packed Q4 through 72 singleton requests.
+
+V-only attention removes most attention work from an all-singleton batch, so
+the general 32-token MFMA crossover no longer represents the complete route.
+An alternating packed A/B kept the direct kernels active beyond 32 tokens.
+Direct improved B32/B48/B64/B68/B72 by `1.655x`, `1.355x`, `1.130x`, `1.103x`,
+and `1.068x` with minimum cosine `0.999983609`. B76 was only `1.024x`, B80 was
+neutral, and MFMA won from B84 onward. The architecture-neutral runtime guard
+therefore uses `EI_ROCM_SINGLETON_DIRECT_MAX_TOKENS=72`. This significant
+concurrent-throughput pass resets the insignificant-pass counter.
+
+### ROCm Pass 25: Paired Q4 at Extended Singleton Shapes
+
+Status: retained through the singleton direct-route ceiling.
+
+The Pass 24 crossover exposes direct shapes beyond the original T31 pairing
+sweep. Exact alternating A/B at B16/B24/B32/B48/B64/B72 measured `1.111x`,
+`1.091x`, `1.102x`, `1.096x`, `1.101x`, and `1.111x` for paired Q4 versus
+one-row Q4. B8 remained neutral, and B76/B80 correctly remained neutral
+because they route to MFMA. This interaction confirms the existing 16-token
+pairing threshold and resets the insignificant-pass counter.
+
+### ROCm Pass 26: Four-Row Direct Q4 Reuse
+
+Status: rejected; retained only as `EI_ROCM_DIRECT_Q4_QUAD=1` for diagnostics.
+
+Four-row V-only, QKV, attention-output, and FFN-down kernels doubled activation
+reuse relative to the paired route. The extra accumulators and weight fragments
+raised VGPR pressure: single-sequence T8/T16/T24/T31 ranged from `0.981x` to
+`1.009x`. Packed B32/B48/B64/B72 measured `1.020x`, `1.021x`, `1.007x`, and
+`1.030x`, while B16 regressed to `0.965x`. Cosine was exactly 1, but there was
+no broad gain above 3%, making this insignificant pass 1 of 3.
+
+### ROCm Pass 27: Pinned Host I/O Staging
+
+Status: rejected; retained as `EI_ROCM_PINNED_IO_STAGING=1` for diagnostics.
+
+Reusable HIP-pinned buffers stage token IDs, offsets, and returned embeddings,
+avoiding pageable-memory handling inside asynchronous copies. Engine A/B ranged
+from `1.011x` at T1 to `1.037x` at T16, but fell to `0.999x` at T512 and
+`0.992x` at T2048. Packed singleton B1-B8 improved `1.008x-1.019x`; B32-B256
+were only `1.002x-1.021x`. The isolated B16 result was `1.044x`, but the sweep
+does not support enabling extra pinned allocations for that one point. This is
+insignificant pass 2 of 3.
+
+### ROCm Pass 28: Post-Fusion HIP Graph Replay
+
+Status: rejected; `EI_ROCM_COMMAND_GRAPH` remains disabled.
+
+The graph experiment was repeated after residual, embedding, metadata, and
+singleton launch reductions changed the captured workload. Nine-warmup,
+51-iteration A/B measured `0.991x`, `0.974x`, `0.990x`, `0.972x`, `0.992x`,
+and `0.994x` at T1/T4/T8/T16/T31/T32. T128/T512/T2048 were neutral at
+`1.005x`, `0.999x`, and `1.003x`, all with cosine 1. This is insignificant pass
+3 of 3, so the continuation loop stops here.
+
+### ROCm Continuation Stop
+
+The last significant result was the paired-Q4 interaction across the new
+singleton-direct range. The following three experiments produced no broad
+gain above 3%: four-row Q4 reuse, pinned host staging, and post-fusion HIP graph
+replay. Their guarded implementations remain diagnostic-only and disabled;
+the measured two-row, fusion, metadata, and batch-aware crossover routes are
+the production defaults.
+
+### ROCm Continuation Final Validation
+
+The expanded ROCm suite found and fixed two diagnostic-toggle guard bugs:
+metadata elision now requires V-only attention, and disabling direct RMS cannot
+skip intermediate FFN residuals when final singleton pooling is enabled. The
+portable build then passed all 10 llama.cpp goldens at minimum cosine
+`0.999911070`, CPU/ROCm synthetic drift at `0.991408229`, packed batch parity at
+`0.999882340`, all new route-toggle comparisons, and HTTP Matryoshka tests. The
+direct/MFMA singleton crossover comparison passed at minimum cosine
+`0.999979198`. CPU and Metal regression suites also passed.
+
+Final nine-warmup/51-iteration medians were 0.933 ms at T1, 1.576 ms at T7,
+1.903 ms at T16, 2.623 ms at T31, 3.600 ms at T32, 3.409 ms at T96, 3.556 ms
+at T128, 4.781 ms at T256, 6.044 ms at T512, 7.260 ms at T1024, 8.576 ms at
+T1536, and 9.941 ms at T2048. That is 1,072 T1 req/s and 206,011 input tok/s at
+full context.
+
+Default explicit singleton batches measured approximately 18,522 req/s at B32
+and 26,014 req/s at the B72 direct ceiling; native MFMA measured 65,358 req/s
+at B256. A 256-request dynamic-service run at T32 reached 273/279/746/1,198/
+1,645/3,952 req/s at concurrency 1/2/4/8/16/32, with average batch 28.4 at C32.
+`roc-obj-ls` confirmed `gfx908`, `gfx90a`, `gfx942`, and `gfx950` code objects in
+the final binary.
+
+## 2026-07-20: Metal 4 Tensor Projections, Flash Attention, And Packing
+
+Status: retained for Metal on Apple GPUs reporting `MTLGPUFamilyMetal4`.
+
+The Metal build now embeds two libraries: the existing Metal 3.1 library in
+`__DATA,__metallib` and a `-std=metal4.0` library in `__DATA,__metal4lib`.
+Runtime selection requires `supportsFamily:MTLGPUFamilyMetal4`, so older
+Apple Silicon keeps the prior pipelines. `scripts/stage-release.sh` verifies
+both embedded sections.
+
+`src/metal4/kernels/tensor_qgemm.metal` adapts llama.cpp's `<metal_tensor>`
+MetalPerformancePrimitives Q4_0 matmul into model-specialized projections:
+`ei_q4_0_f32_tensor_mm`, a fused Q/K/V variant, a fused up/gate variant, and
+64-column instantiations of all three selected at exactly 64 flattened
+tokens. The general tile is 128 token columns by 64 output rows with a
+32-wide K tile and four simdgroups. The 64-token tile reduced the T64
+in-process median from 4.7305 ms to 3.9570 ms and turned the failing 64-token
+c1 HTTP cell from 202.3 versus 207.7 embeddings/s into 240.8 versus 207.8.
+
+`src/metal4/kernels/flash_attention.metal` adds
+`ei_flash_attention_f16_kv_256` for EmbeddingGemma's three query heads, one
+shared KV head, and head dimension 256, with eight query rows per
+threadgroup, 32-key online-softmax tiles, exact symmetric-window masking,
+half Q/K/V math, and FP32 softmax/output. Single-sequence flash begins at 128
+tokens and packed sequences at 192 tokens. FP16 K/V storage is zero-padded to
+tile alignment. A mixed-batch routing bug that keyed packed flash eligibility
+to the maximum sequence length forced short members onto FP16 flash and
+produced 0.999830604 cosine for a 32-token member; eligibility now keys to
+the minimum sequence length and the mixed `{1,7,32,129,192}` batch passes at
+minimum cosine 0.999956071.
+
+The request-packing cutoff rose from 512 to 1024 tokens after packed-versus-
+serialized measurements of roughly 1.34-1.41x at T512 B2/B4/B8 and
+1.04-1.05x at T1024 B2/B4; T2048 stayed serialized at roughly 0.997x.
+Representative full-graph in-process medians: T128 5.147 ms, T512 7.749 ms,
+T1024 12.673 ms, T2048 27.439 ms (about 74.6k input tokens/s, versus
+175.5 ms before tensor projections and flash attention).
+
+## 2026-07-20: Grisu2 Float Serialization For HTTP Responses
+
+Status: retained for all backends.
+
+The first fail-fast llama.cpp comparison stopped at 8 tokens c8 with 992.6
+versus 1107.6 embeddings/s. A worker-thread `sample` profile showed
+`snprintf("%.9g")` dominating through `__dtoa` and locale locks: 768 float
+formats per 768-dimensional response. `src/float_format.c` now carries a
+float-only C11 port of the Grisu2 shortest-round-trip formatter from
+llama.cpp's bundled nlohmann JSON (MIT, Loitsch and Lohmann attribution
+retained), and `src/server.c` reserves response capacity once and writes
+formatted floats directly into the response buffer. `test_float_format`
+verifies exact bitwise round trips for 1,000,012 finite values. The isolated
+cell recovered to 1,160.1 versus 1,105.2 embeddings/s, and the full 8-token
+sweep passed at 1.18/1.31/1.79/1.07/1.04/1.17x llama.cpp
+(`perf/results/2026-07-20/metal4-float-format-c8/`,
+`metal4-float-format-short/`).
+
+## 2026-07-20: Demand-Aware Wave Batch Collection
+
+Status: retained for all backends.
+
+A restarted comparison failed at 8 tokens c16 with 1309.5 versus 1641.8
+embeddings/s, conflicting with two earlier wins on the same shape. Three
+quiet-host reruns showed llama.cpp stable at 1632-1766 while we swung
+between 1696 and 2074 embeddings/s: the dynamic batcher was bimodal over
+HTTP. The old collector armed one fixed 200 us deadline per batch, and its
+readiness predicate (64 requests or 4,096 tokens) could never fire at c16,
+so wave formation depended on all resubmissions landing inside one window;
+when they straggled, the wave split and phase-locked (in-process, forcing an
+800 us wait produced average batch 16.00 and better latency than 200 us,
+proving truncation).
+
+The scheduler now tracks the peak number of concurrently in-flight requests
+since the previous dispatch. Collection starts whenever more clients are in
+flight than queued, keeps extending its deadline while new requests arrive
+(bounded by `EI_BATCH_WAIT_MAX_US`, default four times `--batch-wait-us`),
+and dispatches the moment the queue reaches the tracked peak.
+`EI_BATCH_WAVE=0` restores the fixed window. An intermediate design that
+targeted recent batch sizes instead of in-flight demand locked splits in
+(two of ten repeats collapsed to average batch 8.00) and was rejected.
+
+In-process T8 (`perf_concurrency_metal`, 2,000 requests):
+
+| concurrency | before req/s | after req/s | before batch | after batch |
+|---:|---:|---:|---:|---:|
+| 1 | 479.9 | 483.3 | 1.00 | 1.00 |
+| 2 | 490.3 | 758.1 | 1.03 | 1.99 |
+| 4 | 946.5 | 1,070.3 | 3.03 | 3.98 |
+| 8 | 1,837.5 | 2,113.0 | 6.10 | 7.97 |
+| 16 | 2,689.4 | 3,259.1 | 10.10 | 15.87 |
+| 32 | 4,627.2 | 5,900.9 | 17.70 | 31.75 |
+
+The c2 gain also fixes an alternating singleton pathology where the second
+client's hot window expired during the first client's execution. p95 latency
+fell at every level (c16: 6.98 ms to 4.97 ms). Batch parity cosine stayed
+0.999956071, T512 packing still fills 4,096-token batches, and T2048 stays
+serialized. Paired HTTP T8 c16 went from bimodal 1696-2074 to 2189/2186/1841
+against llama.cpp's 602-1641, and isolated c32 measured 3,174.0 versus
+2,774.4 (`perf/results/2026-07-20/metal4-c16-recheck-run*/`,
+`metal4-wave-t8-sweep/`, `metal4-c16-wave-run*/`, `metal4-c32-wave/`).
+
+Warm-sweep measurements also showed llama.cpp degrading under sustained
+mixed-concurrency serving (8-token c32 fell from about 2,770 fresh to about
+590 warm) while our server showed no hysteresis; published comparisons use
+the runner's new `--fresh-servers` mode so every cell measures both engines
+fresh.
+
+## 2026-07-21: T128 c1 Serving-Path And Encode-Overlap Recovery
+
+Status: retained for all backends (server and service changes) and Metal
+(split command encoding).
+
+The fresh-servers matrix stopped at 128 tokens c1 with 186.7 versus 189.1
+embeddings/s, and three isolated reruns confirmed a stable 1.4% loss
+(186.1-186.4 versus 188.6-189.2). Flash-versus-legacy and tensor-versus-
+legacy A/Bs showed the engine routing was already optimal (flash 5.166 ms
+versus legacy 5.306 ms; tensor 5.191 ms versus legacy 10.792 ms), and
+llama-bench with flash attention measured llama.cpp's engine at 5.146 ms —
+statistically equal to ours. The entire deficit was serving overhead, which a
+worker-thread `sample` profile broke down as roughly 47 us of Grisu2 float
+formatting, 21 us of tokenization, and 66 us of HTTP core per request.
+
+Five changes recovered the cell, applied and measured incrementally:
+
+1. Solo inline execution (`EI_SOLO_INLINE=0` to disable): a request arriving
+   with an idle backend, empty queue, and expected wave of one executes on
+   the submitting worker thread, removing two thread handoffs.
+2. Ryu digit generation replacing Grisu2 in `src/float_format.c` (Ulf Adams'
+   algorithm, tables generated exactly from big-integer arithmetic): 21.4 ns
+   per float, 16.5 us per 768-float response versus about 47 us before. The
+   1,000,012-value bitwise round-trip suite passes unchanged.
+3. Single-writev responses with TCP_NODELAY and no double strlen of the
+   9.7 KB body.
+4. Keep-alive reads use SO_RCVTIMEO instead of poll-then-recv, removing one
+   syscall and one scheduler hop per request; an idle timeout on a clean
+   connection boundary closes silently as before.
+5. Split Metal command encoding: the forward pass commits after layer 2 so
+   GPU execution overlaps CPU encoding of the remaining 22 layers. T128
+   in-process fell from 5.166 ms to 5.141 ms and T8 from about 2.04 ms to
+   2.009 ms with bit-identical checksums.
+
+Isolated T128 c1 after the fixes: 190.7/189.8/190.2/189.6 versus llama.cpp
+189.3/189.1/188.5/189.3 — four consecutive wins with our floor above their
+ceiling, from 186.2-186.4 before. Batch parity cosine 0.999956071, backend
+parity, HTTP Matryoshka, and the T8 concurrency ladder (485/758/3,277/5,921
+req/s at c1/c2/c16/c32) are unchanged
+(`perf/results/2026-07-21/t128c1-*/`).
+
+## 2026-07-21: Solo-Inline Versus Backend Dispatch Race
+
+Status: fixed; solo inline execution retained.
+
+The battery-power matrix reached 2048 tokens c2 and lost three consecutive
+paired measurements by 0.4-3% — while our own c1 cell won 1.42x. Serialized
+processing should never slow down when a second client appears, and
+in-process c2 matched c1 exactly, which isolated the regression to the
+service layer under HTTP timing. The cause was a race introduced with solo
+inline execution: an inline run claims `backend_busy`, but the backend
+dispatch loop only waited on queue emptiness — a request arriving during an
+inline run signaled the backend, which dispatched it concurrently into the
+non-reentrant engine. Interleaved encodes inflated per-request latency
+(41.7 ms versus 31 ms forward on battery) and could corrupt concurrent
+embeddings in the race window. Long forwards at 2048 tokens c2 kept
+re-opening the window, which is why this shape exposed it.
+
+The backend idle wait now also waits out `backend_busy` (inline completion
+always signals `queue_ready`, covering shutdown), so engine execution is
+single-flight again. Isolated 2048-token c2 on battery went from 24.0 versus
+24.1 losing to 34.3 versus 26.7 embeddings/s — a 1.28x win matching the c1
+margin — and batch parity (0.999956071), the T8 wave ladder, and in-process
+c1/c2 equality at T2048 all held (`perf/results/2026-07-21/t2048c2-racefix-*/`).
+
+## 2026-07-21: Complete llama.cpp Comparison Matrix
+
+Status: accepted and published in README.
+
+The full 54-cell fresh-servers matrix (8-2048 tokens x concurrency 1-32,
+5-second targets, caches disabled, llama.cpp b8981) completed with zero
+loss-retries: geometric-mean throughput 1.25x llama.cpp, range 1.01x-2.01x,
+minimum cross-server cosine at or above the 0.999 gate. Measured on battery
+power (recorded in the summary); ratios are paired and order-alternated, so
+the uniform battery throttle affects both engines equally. Full validation
+passed afterward: unit and Metal suites, HTTP Matryoshka, the
+1,000,012-value float round-trip check, runner compilation, release-script
+syntax, and both embedded Metal library sections
+(`perf/results/2026-07-21/metal4-final-battery2/`).
+
+## 2026-07-21: The 2x Push — Compute-Bound Ceiling, Caching, And Opt-in int8
+
+A concerted effort to move from ~1.4x to 2x vs llama.cpp. It mapped the ceiling
+precisely; the honest conclusion is that same-hardware compute optimization
+cannot reach 2x for this model, and the real multiplier is caching.
+
+### Launch/capture levers — exhausted (compute-bound)
+
+Measured on all four GPU backends that per-forward launch/encode overhead is
+NOT the bottleneck:
+
+- Metal: an env-gated probe split CPU-encode+submit from GPU-wait. Encode is
+  only ~1-4% of the forward (0.05-0.10 ms of 1.5-8 ms); Metal is
+  GPU-compute-bound and its cheap encoding is already overlapped by the
+  split-command-buffer. A reusable indirect-command-buffer capture would chase
+  a ~2% ceiling — not built.
+- CUDA already graph-captures (launches free); a SwiGLU→quant fusion was
+  bit-identical but neutral/-3% (rejected).
+- ROCm: the same SwiGLU→quant fusion regressed -45% at T1 (coarse 32-row blocks
+  collapse occupancy); enabling the existing (default-off) HIP graph capture was
+  neutral on uniform load and -1.5% on mixed traffic (16-entry FIFO thrash).
+  Both kept opt-in/off.
+
+Lesson: fusion-to-cut-launches only helps where submission genuinely dominates.
+The one such backend is XPU (SYCL immediate-command-list submission is ~97% of a
+small-batch forward); its ctx->half attention-epilogue fusion
+(`EI_XPU_FUSE_ATTN_OUTPUT_HALF`) is +2-5% and retained opt-in.
+
+### W4A8 on the int8 matrix engines — real but small
+
+The model already carries int8 activations (DP4A/sdot4/NEON), but the default
+fast paths use the fp16 matrix engines. A naive IMMA swap beats the *equivalent*
+naive fp16 MMA by +8-16% yet loses ~2x to mature cuBLAS fp16. Per-32-block
+scales rule out vendor INT8 GEMMs (single-scale over K); requant to per-row int8
+was rejected by the user.
+
+A serious hand-written per-block int8 GEMM (shared-mem staging, cp.async
+double-buffering, tuned 64x64/4-stage) then **beat cuBLAS fp16 by 1.0-1.41x** on
+the projections (cp.async the biggest lever, 3x over naive), golden cosine held
+at 0.99987. But projections are only ~40% of the T2048 forward and are too small
+(K=768/1152) to be compute-bound — even cuBLAS runs them at ~30% of peak — so
+the end-to-end win is ~3% at T>=1024 (`EI_CUDA_W4A8_GEMM`, opt-in, gated high
+tokens; test_batch self-parity ~0.997, an int8-activation ceiling).
+
+int8 flash attention (`EI_CUDA_INT8_ATTN`): int8 Q.K^T via cuBLAS IMMA is ~1.5-2x
+on that GEMM but the quant+fp32-softmax overhead halves it — ~3% end-to-end at
+T>=1024, accuracy-safe within T512-2048 (route parity tightens to ~0.998). int8
+P.V (mode 2) quantizes heavy-tailed softmax probabilities and breaks accuracy
+(0.9839 < 0.99) — implemented behind =2 but not for use.
+
+### Verdict on 2x
+
+2x-vs-llama.cpp is not reachable by same-hardware compute optimization: short
+sequences are weight-bandwidth-bound (unfixable), and the entire compute-bound
+int8 effort adds ~6% at long sequences, opt-in, with accuracy tradeoffs. The
+real >2x (up to infinite on a hit) is the persistent exact cache for
+repeat/re-index/eval workloads.
+
+### Shipped (default, this session)
+
+- Persistent exact-embedding cache (`--persistent-cache-path`), shared code,
+  model-fingerprint-guarded, atomic writes.
+- Metal fused up/gate/GELU default-on (+2% low-token, cosine unchanged).
+- Benchmark both-orders averaging to cancel the fixed per-cell measurement-order
+  bias (collapsed the T2048 1.39x/1.05x sawtooth to a true ~1.30x).
+
+### Retained opt-in (default OFF, documented)
+
+- `EI_XPU_FUSE_ATTN_OUTPUT_HALF` (+2-5%), `EI_CUDA_W4A8_GEMM` and
+  `EI_CUDA_INT8_ATTN` (~3% each at T>=1024, ~6% combined, high-token, with the
+  route-parity/self-parity tradeoffs above).
+
+### Rejected (measured non-wins, not shipped)
+
+- CUDA and ROCm SwiGLU->quant fusion (neutral / -45%), ROCm default graph
+  capture (neutral / -1.5% mixed). Kept opt-in-off or not landed.
+
+## 2026-10-07: EmbeddingGemma 2 native Metal graphs
+
+Status: implemented and validated on Apple M5 Max. The Metal executable now
+selects Metal for the default EmbeddingGemma 2 profile. Native text, vision,
+and audio graphs use resident Q8/BF16/F32 GGUF weights and reusable GPU
+workspaces; sampled video frames use the vision graph. Image decoding,
+resizing, and WAV/log-mel preprocessing remain on the CPU. Production does
+not link llama.cpp, ggml, or mtmd. Other accelerator ports for this profile
+remain pending.
+
+Packed text inference resets RoPE positions per sequence, masks attention at
+sequence boundaries, and pools each sequence separately. Packing is bounded
+to 8192 total tokens per GPU graph, with larger batches split into waves.
+The default FP32 Metal 3.1 path preserves the CPU reference graph. New numeric
+optimizations follow the repository's default-off policy:
+
+- `EI_GEMMA2_METAL_TENSOR=1`: Metal 4 64x64 projection tiles from 32 tokens,
+  decoding packed Q8/BF16/F32 weights into FP16 tiles; FP32 activations and
+  accumulation. Applies to text, vision, and audio projections.
+- `EI_GEMMA2_METAL_FLASH=1`: 8-query/32-key tiled attention from 128 tokens,
+  specialized for vision width 64 and text widths 256/512, grouped KV heads,
+  and packed sequence bounds. FP16 Q/K/V, FP32 probabilities and accumulation.
+- `EI_GEMMA2_METAL_PROFILE=1`: CPU encoding/GPU/total timing diagnostics.
+
+Hardware/toolchain: M5 Max, macOS 26.6.2 (25G83), Xcode 27.0 (27A266a),
+Apple clang 21.0.0, Metal Toolchain 27A266a. Working tree based on `55964e2`,
+with the uncommitted second-profile implementation. The Xcode Metal component
+was missing after the toolchain update and was installed before compilation.
+
+Measured full-graph latency, averaging medians from direct/optimized and
+optimized/direct order, two warmups and five iterations per cell, two seconds
+between runs. These compare two native implementations of the new profile,
+not llama.cpp or the original 300M model:
+
+| tokens | direct FP32 (ms) | tensor + flash (ms) | speedup |
+|---:|---:|---:|---:|
+| 1 | 4.096 | 4.062 | 1.01x |
+| 32 | 27.277 | 26.191 | 1.04x |
+| 512 | 455.198 | 29.877 | 15.24x |
+| 2048 | 2157.080 | 79.212 | 27.23x |
+
+At T32, packed batches of 4 and 16 took 25.250/29.975 ms versus
+104.973/420.149 ms serialized (4.16x/14.02x), minimum cosine 0.999965310.
+The batch harness alternates measurement order within each cell. Raw runs:
+`perf/results/gemma2-metal-2026-10-07/` (ignored). CPU encoding measured about
+0.2 ms versus 26-30 ms GPU time at T32/T512: no graph-capture work was added.
+These are engine measurements; the original profile's 54-cell HTTP claims
+must not be applied to this profile.
+
+Correctness:
+
+- Reference fixtures: text minimum cosine 0.999720425. Direct vision tower
+  0.999124900, final vision embedding 0.999815996; audio tower 0.999920276,
+  final audio embedding 0.999738263. Both optimized flags also pass every
+  reference gate (minimum raw vision cosine 0.999109421).
+- Direct/optimized text routes at 1, 7, 31, 32, 33, 127, 128, 129, 512,
+  1025, 2048, and 8192 tokens: minimum cosine 0.999991856.
+- Mixed packed batches spanning both thresholds: direct self-parity 1.0;
+  optimized minimum 0.999968472. Larger vision/audio route comparisons pass.
+- `make test-gemma2-metal` and the same suite with both flags enabled:
+  all HTTP modalities, mixed inputs, dimensions, concurrency, limits, and
+  default-profile selection pass. The helper asserts the selected backend.
+- `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 make test-gemma2-metal-routes`
+  passes. Validation initially exposed its doubled shadow-memory footprint
+  exceeding 32 KiB for the 512-wide flash kernel. Its disjoint FP32 output
+  accumulator tiles now use device scratch, keeping threadgroup use below
+  16 KiB and preserving parity and measured throughput.
+- Original-profile `make test-metal test-http-metal`, CPU `make test`, and
+  `make check` pass. Original Metal packed parity remains 0.999956071.
+
+Retain both optimized paths as opt-in. No new-model performance claim against
+llama.cpp has been established. Short-request latency and further media
+throughput tuning remain separate measured optimization work.
+
+## 2026-10-09: EmbeddingGemma 2 batched-serving Metal stack
+
+Status: implemented behind default-off flags (`EI_GEMMA2_METAL_GEMV`, `_FUSED`,
+`_TENSOR2`, `_FLASH2`) and `--pipeline-slots N`; byte-identical when off.
+Design and ceilings: `perf/gemma2_kernel_design.md`. Target is the hardware
+ceiling under concurrent load, not llama.cpp (single-request design); llama.cpp
+rows below are context only.
+
+Host: M5 Max (6P+12E, 128 GB), macOS 26.6.2, AC power. A resident VM (~11%
+memory) and the user's single-core compiler builds ran throughout; engine A/Bs
+are back-to-back in one process (`make bench-gemma2-metal`, median of 3-7), so
+both sides see the same conditions.
+
+Why the default path did not scale: `g2_mm` is one simdgroup per (row, token)
+with no weight reuse across tokens, so packing four 32-token requests cost what
+four separate requests cost. HTTP default at 32 tokens: 36.6 emb/s at c1, 42.9
+at c16 (llama.cpp 127 / 766). Ablation (`EI_GEMMA2_METAL_SKIP`) showed a T=1
+forward was a ~600-dispatch dependency chain at ~7-10 us per dispatch.
+
+Retained, each measured against the route before it (engine, ms):
+
+| step | 1x1 | 32x1 | 32x4 | 128x1 | 32x16 | 512x4 | 2048x1 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| default | 4.1 | 27.2 | 94.7 | 100.7 | 367 | - | 2157 (10-07) |
+| + GEMV (weight-stationary, 4 rows x 8 tokens/decode) | 3.0 | 7.1 | 13.6 | 24.2 | - | - | - |
+| + FUSED (25 -> 11 dispatches/layer) | 2.24 | 6.7 | 14.0 | 20.1 | 44.3 | - | - |
+| old TENSOR+FLASH (10-07 opt-in) | 4.05 | 26.2 | 25.4 | 25.3 | 30.0 | 79.7 | 79.6 |
+| + TENSOR2 (fp16 row-major matmul2d, relaxed) + FLASH | 2.25 | 6.9 | 5.9 | 5.9 | 12.4 | 59.5 | 59.4 |
+| + FLASH2 (matmul2d flash) | 2.24 | 5.4 | 5.6 | 5.9 | 8.7 | 31.5 | 42.1 |
+
+8192x1: 487.7 -> 277.7 ms (1.76x) for FLASH2 over the old flash. At 2048 tokens
+the GEMMs run ~15 ms (~37 TFLOPS of the 43-55 matmul2d ceiling); attention is
+the remaining majority. GEMV/TENSOR2 crossover ~36 tokens (default 40);
+FLASH2 from 16 tokens; 64-token GEMM tiles from 256 tokens.
+
+Rejected or superseded (engine A/B vs old TENSOR+FLASH unless noted):
+
+- matmul2d with a native int8 operand and per-32-group scales applied to a
+  temporary cooperative tensor (SlimServe's uint4 recipe): 16 tokens 17.7 ms vs
+  GEMV 3.8; 512 tokens 58 ms vs 30. One K=32 matmul2d per group plus the scale
+  pass is far too fine-grained once compute-bound (SlimServe's win was
+  bandwidth-bound decode). `char` is rejected by MPP; `int8_t` compiles.
+- fp16 dense weights in a tile-major [k][64] layout, strict precision:
+  2048x1 0.93x. K step 32/64/128: no difference.
+- fp16 activation copies for the GEMM (+1 dispatch): no gain over fp32
+  device operands (512x1 13.2 vs 13.6 ms), so activations stay fp32.
+- The winner differs from the above only in row-major weights read as a
+  transposed operand plus `relaxed_precision`: 2048x1 1.32x, 512x1 2.24x.
+- A routing bug (the BF16 PLE projection falling to `g2_mm`; 32..39-token
+  waves sending every weight to the old tile kernel) briefly looked like a GEMM
+  regression; ablation found both.
+
+Concurrency (engine, `EI_BENCH_STREAMS`, separate queue + workspace per
+stream, same route): aggregate scaling for 2 / 3 streams was 1.75x / 2.00x at
+1x1, 1.82x / 2.05x at 32x4, 1.38x / 1.37x at 32x16, 1.04x / 1.06x at 512x4.
+Independent command buffers overlap on the GPU when they share no written
+resources, exactly SlimServe's in-flight lesson; small latency-bound waves gain
+most. This motivated `--pipeline-slots`: per-slot clones of the Metal context
+(shared device, pipelines, weights), N backend threads in the inference
+service, and media on its own context so text waves skip the global lock.
+
+Correctness with `FUSED,TENSOR2,FLASH2`:
+`EI_GEMMA2_ROUTE_FLAGS=FUSED,TENSOR2,FLASH2 make test-gemma2-metal-routes`
+passes (text 1..8192 >= 0.999991682; packed self-parity >= 0.999947736;
+vision >= 0.999999157; audio >= 0.999999075). `make test-gemma2-metal` with the
+flags passes; goldens unchanged (text 0.999720429, vision 0.999815995, audio
+0.999738334). A 3-slot server matched a 1-slot server on 64 concurrent texts
+and an image to 0.999999676.
+
+### Follow-ups the same day
+
+- fp16 K/V written by `g2_qkv_post` when FLASH2 runs (drops two conversion
+  dispatches per layer): 512x4 31.5 -> 30.6 ms, 2048x1 42.1 -> 40.8 ms. Kept.
+- Rejected: folding each post-norm/residual into the next GEMV's prologue
+  (8 dispatches/layer instead of 11, ping-pong residual buffers). 1x1 2.33 ->
+  2.38 ms; 8..39 tokens 2-3.7x slower: every simdgroup rebuilt its inputs with
+  scalar loads and per-element weight-type switches. Removing 72 dispatches
+  also bought nothing at T=1, so the earlier "~7 us per dispatch" ablation
+  over-attributed launch cost; the short kernels themselves dominate.
+- `--pipeline-slots`: a fix was needed first (a backend thread could claim a
+  slot after its wave-collection wait while others had taken them all; the
+  out-of-range slot fell back to slot 0 and two waves shared a context:
+  `EmbeddingGemma 2 Metal: (null)` at 8 tokens x c32). Interleaved A/B on one
+  binary (1,3,3,1 slots per shape, 4 s each):
+
+  | ~tokens | c4 | c16 | c32 |
+  |---:|---:|---:|---:|
+  | 4 | 0.84x | 0.72x | 0.67x |
+  | 30 | 1.01x | 0.72x | 0.85x |
+  | 128 | 1.02x | 0.99x | 1.05x |
+  | 512 | 1.01x | 0.99x | 1.02x |
+
+  The single-slot collector already packs every waiting request into one
+  wave; packing four tiny sequences costs about one, while overlapping waves
+  only recovers latency (engine overlap 1.75x). Separate HTTP matrix runs are
+  not comparable across time on this busy host (the 1-slot 128 x c32 dip to
+  327 emb/s did not reproduce: 547 emb/s in a direct run). Kept opt-in;
+  the hypothesis left is mixed traffic (short requests behind long waves),
+  which needs an admission rule and a mixed-load benchmark.
+
+HTTP, 1 slot, `FUSED,TENSOR2,FLASH2` (`perf/results/gemma2-2026-10-09/
+new-stack-slots1`, both orders, llama.cpp as context): emb/s
+
+| tokens | c1 | c4 | c16 | c32 |
+|---:|---:|---:|---:|---:|
+| 8 | 256.6 | 527.1 | 1,638.2 | 2,731.3 |
+| 32 | 181.0 | 428.6 | 1,145.3 | 1,678.9 |
+| 128 | 165.2 | 318.7 | 453.8 | 326.9 |
+| 512 | 90.5 | 104.1 | 109.1 | 90.2 |
+| 2,048 | 22.0 | 20.1 | 18.4 | 14.3 |
+
+Default path at 8/32 tokens x c16 was 164.6 / 42.9 emb/s (10x / 27x).
+Geomean 1.35x llama.cpp, range 0.97x-1.78x (the 0.97x is the 128 x c32 cell
+above).
+
+## 2026-10-09: EmbeddingGemma 2 CPU fast path and pool spin
+
+`EI_GEMMA2_CPU_FAST=1` (`src/gemma2_fast.c`), `EI_POOL_SPIN_US`. M5 Max,
+18 threads, user builds running; `make bench-gemma2-cpu`, median of 5, ms:
+
+| case | reference | fast | + short width 6 | + spin 50 us |
+|---|---:|---:|---:|---:|
+| 1x1 | 21.1 | 20.1 | 5.9 | 1.45 |
+| 8x1 | 40.2 | 25.6 | 10.2 | 4.9 |
+| 32x1 | 93.4 | 32.0 | 36.0 | 8.4 |
+| 32x16 | 1504 | 148.5 | 146 | 89 |
+
+Findings:
+
+- Short waves were thread-wake bound: 168 GEMM calls per forward each woke
+  up to 17 workers through per-worker condition variables (~100 us per call).
+  Fewer tasks (6) and then spinning workers fixed it. The spin pool needed
+  generation and participant count published as one 64-bit ticket: a worker
+  that sat out one call could otherwise pair its generation with the next
+  call's participant count and steal a completion (observed hang).
+- GELU `tanhf` was 25M scalar calls at 512 tokens; a NEON exp-based tanh
+  took row kernels 40.6 -> 29.9 ms there.
+- The PLE projection converted BF16 per element through a type switch;
+  NEON widening is small at 1 token (19.4 -> 17.6 ms before the width fix).
+- Accuracy: both CPU graphs quantize activations to Q8, so on BOS-less text
+  windows each sits 0.98-0.999 from the FP32 Metal path, and from each other;
+  the fast path tracks Metal as closely as the reference (`metal-fast` vs
+  `metal-ref` within +-0.005 at 1-64 tokens; bit-identical at 1 token).
+  Random ids exaggerate this (0.93). Goldens: text 0.999733 (fast) vs
+  0.999720 (reference Metal); `make test-gemma2` passes with the fast path,
+  with and without spin; `make test` (300M CPU) passes with and without spin.
+- Remaining CPU work: the Q8 GEMM runs ~1.5 TOPS at 512 tokens against a
+  ~4.5 TOPS `sdot` estimate; next are i8mm (`smmla`) with load-time
+  interleaved weights, then an SME2 experiment, then attention tiling.
+
+## 2026-10-09 (evening): second round, media, and new defaults
+
+Engine A/Bs, M5 Max, one process, median of 5-7 (`make bench-gemma2-metal`):
+
+- Metal RoPE tables in `g2_qkv_post` (two bases, 8192 positions, ~24 MB):
+  ~2-3% at 512x4/2048x1, at the noise edge; kept (removes ~38M
+  transcendentals per 2048-token forward).
+- GEMM epilogues on the wide route: FFN up/gate interleaved per 64-row tile
+  so `gelu(gate)*up` is written from the tile (threadgroup staging), and the
+  PLE gate fused into `inp_gate`: 512x4 29.6 -> 27.0 ms (1.10x), 2048x1 39.8
+  -> 37.1 ms (1.07x), short waves neutral to +4%.
+- Flash tile sweep (`EI_GEMMA2_METAL_FLASH2_TILE`): 32 queries x 128 keys
+  1.06x (512x4), 1.10x (2048x1), 1.16x (8192x1) over 32x64; 64x64 on 8
+  simdgroups 0.98-1.02x; 64x128 needs 49.9 KB threadgroup memory (> 32 KB).
+  32x128 is the default. Cumulative: 512x4 30.5 -> 25.4 ms (81k tok/s), 2048x1
+  40.7 -> 33.6 ms (61k tok/s).
+- Rejected: folding `post_add` into the GEMV prologue (earlier entry); a
+  full-row (N = 512) GEMM tile to fold `post_add` into the wide GEMM was not
+  built: it spills (128 floats/thread at TM 32) or exceeds threadgroup memory.
+- MPP also offers `reduce_rows` and `get_left_input_cooperative_tensor`
+  (destination -> left operand), which would allow a register-resident flash
+  attention without the S/P threadgroup round trip; not yet tried.
+
+Media (`build-dev/probe/media.c`, per call, ms):
+
+| | default | 10-07 TENSOR+FLASH | new stack |
+|---|---:|---:|---:|
+| vision 432x432 (81 tokens) | 642 | 27 | 12.5 |
+| vision 768x768 (256 tokens) | 2,676 | 81 | 59 |
+| audio 30 s (750 tokens) | 1,136 | 52 | 23.5 |
+
+- Before the fixes the new stack was 3-10x slower than the 10-07 routes on
+  vision: width-64 attention fell back to the scalar kernel and projector
+  weights to the old tile GEMM. Projector weights now get fp16 copies at
+  first use (audio 46 -> 24 ms); width-64 attention uses the simdgroup flash
+  kernel because every `g2t_flash<64, ...>` instantiation (32x128 and 32x64)
+  crashes the driver at first dispatch (`AGX::RayPayloadSizeAlignImpl::
+  merge`, EXC_BAD_ACCESS, macOS 26.6.2).
+- The media HTTP path held the global inference lock for JSON parsing,
+  base64/image decoding, resizing and log-mel; the lock now covers only the
+  engine calls. 768x768 PNG at c8: 16.0 img/s (62 ms/image), i.e. GPU-bound.
+- An earlier probe sweep reporting identical media times for every flag set
+  was a harness error (flags not applied); disregard it.
+
+CPU (`make bench-gemma2-cpu`, spin 50 us, ms):
+
+| case | reference | sdot | + i8mm | + f32 tile, attention tiles |
+|---|---:|---:|---:|---:|
+| 1x1 | 21.1 | 1.40 | - | 1.34 |
+| 8x1 | 40.2 | 4.51 | 3.29 | 3.0 |
+| 32x4 | 359 | 25.0 | 18.3 | 15.2 |
+| 32x16 | 1,504 | 88.8 | 64.6 | 54 |
+| 512x1 | 1,059 | 158.5 | 133.2 | 81 |
+
+- `smmla` on row-pair-interleaved weights: Q8 GEMM ~1.5 -> ~4.4 TOPS at 512
+  tokens (31.7 ms). Activations are paired per call.
+- The BF16 PLE projection, one dot per (row, token): 12.5 -> 4.3 ms with a
+  4x4 register tile.
+- Attention: 8-query blocks per head with 4x4 Q.K^T register tiles and P.V
+  in registers across the key loop: 512x1 72 -> 28 ms, 2048x1 655 -> 284 ms.
+
+Defaults (end of day): Metal FUSED, TENSOR2, FLASH2 on (TENSOR2/FLASH2 where
+Metal 4 is available); CPU fast graph and i8mm on; the gemma2 CPU pool spins
+50 us (the 300M pool is unchanged). Validation with no flags set:
+`make test-gemma2-metal`, `make test-gemma2-metal-routes` (default stack vs
+all off: text 1..8192 >= 0.99998, packed >= 0.99996, vision >= 0.9999987,
+audio >= 0.999999), `make test-gemma2` (CPU), `make test` (300M CPU),
+`make test-metal test-http-metal` (300M Metal packed parity 0.999956071, as
+before). With FUSED/TENSOR2/FLASH2 = 0 the goldens equal the 10-07 values to
+9 digits.
+
+HTTP with the shipped defaults, no flags (`perf/results/gemma2-2026-10-09/
+defaults`, both orders; llama.cpp as context): emb/s
+
+| tokens | c1 | c4 | c16 | c32 |
+|---:|---:|---:|---:|---:|
+| 8 | 256.3 | 528.8 | 1,692.0 | 2,760.5 |
+| 32 | 185.1 | 449.2 | 1,178.4 | 1,804.0 |
+| 128 | 176.9 | 349.4 | 602.1 | 641.5 |
+| 512 | 103.5 | 98.6 | 94.4 | 74.7 |
+| 2,048 | 21.6 | 14.7 | 18.8 | 17.5 |
+
+1.00x-1.90x llama.cpp, geomean 1.46x (no cell below 1.00x). Against the
+default path of the morning: 8 tokens x c16 164.6 -> 1,692 (10.3x), 32 x c16
+42.9 -> 1,178 (27.5x).
+
+Sustained versus burst: at 512 tokens x c16 the service forms 15-sequence
+(7,173-token) waves plus a lone 16th request. In a 20 s continuous engine
+loop the 15-sequence wave takes 98-145 ms against 88.5 ms in a short burst,
+recovering after idle (GPU clocks and contention on this shared host, not a
+leak). The HTTP rows at 512+ tokens reflect that sustained rate; the lone
+tail wave costs ~3% and was left alone.
+
+## 2026-10-09 (night): EmbeddingGemma 2 on CUDA (RTX 5090)
+
+Test hardware: RTX 5090 (sm_120, 32 GB), driver 595.91, CUDA 13.3, gcc 15.
+The competing vLLM service was stopped for this measurement.
+New `src/gemma2_cuda.cu` (text tower; media towers still run on the CPU pool):
+
+- fp16 row-major copies of every text GEMM weight (Q/K/V and up/gate
+  concatenated), cuBLAS `GemmEx` fp16 x fp16 -> fp32 at every wave size, fused
+  row kernels writing fp16 GEMM inputs (embed, PLE norm, RMS, q/k/v norm +
+  RoPE table, post-norm sandwich, GeGLU, PLE gate, pool), CUDA graphs keyed by
+  (tokens, sequences) with bounds/positions in device buffers.
+- Attention: varlen flash on raw `mma.sync.m16n8k16` (FlashAttention-2 style:
+  per-row online softmax in registers, S accumulators reused as the P.V A
+  operand, K row-major and V transposed in shared memory). Final shape: 8
+  warps (128 queries per K/V tile) x 32 keys, Q fragments from global/L1,
+  width 512 split into two 256-wide output halves.
+  `EI_GEMMA2_CUDA_MMA_ATTN=0` selects the CUDA-core kernel.
+
+`make bench-gemma2-cuda`-style harness (`build/bench_gemma2_cuda`, natural-text
+windows, median of 9, ms):
+
+| wave | CUDA-core attn | mma 4w/2w | mma 8w (final) | tok/s (final) |
+|---|---:|---:|---:|---:|
+| 1x1 | 0.69 | 0.76 | 0.76 | 1.3k |
+| 32x16 | 2.07 | 2.10 | ~2.1 | ~245k |
+| 128x16 | 8.57 | 6.09 | 5.64 | 363k |
+| 512x16 | 69.9 | 32.9 | 24.7 | 332k |
+| 2048x1 | 39.4 | 18.1 | 11.6 | 176k |
+| 8192x1 | 308.6 | 153.2 | 59.5 | 138k |
+
+Route parity (mma vs CUDA-core attention, same process): >= 0.99997 at
+1..8192 tokens; packed vs single >= 0.99995. `make test-gemma2-cuda`
+(goldens + HTTP, CPU media towers): text 0.999725, vision embedding 0.999858,
+audio embedding 0.999765, HTTP suite passed. 300M `make test-cuda` passes on
+sm_120.
+
+Sweep notes: 4 warps x 64 keys with staged Q exceeded the ~99 KB shared
+limit (the first attempt also called `cudaFuncSetAttribute` inside graph
+capture, which broke the capture: cuBLAS status 14); width 512 at 2 warps was
+5.7x a width-256 layer for 2x the FLOPs; 8 warps with Q from L1 fixed it.
+At 512x16 the per-forward profile is GEMMs ~8.8 ms (near tensor-core peak),
+attention ~5.0, post_add 1.9, GeGLU 1.3, qkv_post 0.8.
+
+HTTP (`perf/loadgen.c`, keep-alive, default server flags, 5 s per cell):
+
+| tokens | c1 req/s | c16 req/s | c64 req/s | c64 tok/s |
+|---:|---:|---:|---:|---:|
+| 10 | 1,066 | 8,334 | 15,408 | 154k |
+| 38 | 815 | 3,634 | 5,891 | 224k |
+| 158 | 414 | 1,229 | 1,418 | 224k |
+| 733 | 134 | 257 | 280 | 205k |
+
+Linux portability caught on the box: `clock_gettime` under `-std=c11` needs
+`_POSIX_C_SOURCE` on glibc (now set on Linux only; on macOS it hides
+`_SC_NPROCESSORS_ONLN` and BSD types); `gguf.h` lacks `extern "C"` guards, so
+C++ users include it inside one.
+
+Pending for CUDA: vision/audio towers on the GPU (the CPU pool runs them;
+x86 has no AVX2 path in the fast CPU graph yet), RTX 3090 (sm_86) validation.
+
+### CUDA media towers (same night)
+
+Vision and audio towers ported from the Metal graphs into `gemma2_cuda.cu`:
+projector weights converted to fp16 (GEMM) / fp32 (norms, convs, position
+tables) on first use, audio clamps fused into the fp16 conversion before each
+GEMM and applied after it, width-generic row kernels, the `mma.sync` flash
+kernel generalized to a head count (vision: 12 heads x 64, one sequence), a
+warp-per-(token, head) kernel for the 12-key causal relative attention with
+the 50 tanh soft cap, and the per-layer relative position projection computed
+once. HTTP on the 5090, one request at a time: 768x768 image 5,472 -> 20.6
+ms, 30 s audio 3,538 -> 84 ms (including CPU log-mel); 8 concurrent image
+clients 81 img/s. Goldens: vision tower 0.999140, vision embedding 0.999817,
+audio tower 0.999920, audio embedding 0.999736.
+
+Bug found on the way: outputs varied run to run (vision tower cosine 0.74 to
+0.94). Weight uploads used `cudaMemcpy` from pageable memory, which may return
+before its DMA lands, on the legacy default stream, which does not order with
+the engine's non-blocking stream; lazily uploaded projector weights raced the
+kernels reading them. Uploads now go through `cudaMemcpyAsync` on the engine
+stream followed by a stream synchronize. Inserting diagnostic synchronizes hid
+the race, which is how it was located.
+
+### CUDA portability (3090 / 5090 without per-GPU tuning)
+
+One source for sm_80+ GPUs; nothing assumes the 5090. `mma.sync m16n8k16` is
+compiled only for sm_80+ (fat builds also cover sm_75); tensor-core attention
+is enabled from queried device properties (compute capability >= 8 and opt-in
+shared memory >= the largest flash tile, ~54 KB, within the 3090's 99 KB),
+otherwise a generic CUDA-core kernel (any head count, optional bounds, widths
+64/256/512) serves text and vision. Verified on the 5090: the default fat
+build compiles for sm_75..sm_121 + PTX; `EI_GEMMA2_CUDA_MMA_ATTN=0` passes all
+goldens and the HTTP suite (vision tower 0.999131 through the generic width-64
+kernel). Running sm_86 code on the 5090 through PTX JIT was not possible:
+driver 595.91 (CUDA 13.2) rejects PTX from the 13.3 toolchain ("unsupported
+toolchain"), so 3090 execution itself remains unverified here.
+
+## 2026-10-10: EmbeddingGemma 2 CPU on x86-64 (Ryzen 9 9950X)
+
+`src/gemma2_fast_x86.c`, runtime-dispatched (generic builds, no `-mavx2`),
+following QuixiCore-CPU's x86 findings (sign trick |w| x x*sign(w); AVX-512
+promoted per kernel by measurement). 9950X: 16 Zen 5 cores / 32 threads,
+AVX2, AVX-512 (VL/DQ/VNNI/BF16), AVX-VNNI. `make bench-gemma2-cpu`, ms:
+
+| case | scalar | AVX2 | VNNI 256 | VNNI 512 repacked + parallel repack + width |
+|---|---:|---:|---:|---:|
+| 1x1 | 4.26 | 5.37 | 5.18 | 3.8-4.1 |
+| 8x1 | 24.1 | 10.7 | 12.0 | 6.9-8.6 |
+| 32x16 | 482.6 | 187.5 | 174.6 | 116-121 |
+| 512x1 | 757.9 | 238.3 | 224.7 | 168-170 |
+
+- The 512-bit kernel stores activations as u8 (q XOR 0x80) and seeds each
+  32-byte half's accumulator with the block's precomputed -128*sum(w), so
+  vpdpbusd needs no per-element sign work; two Q8 blocks per instruction.
+- Its first version repacked activations single-threaded per GEMM (~35 ms of
+  156 at 32x16, invisible to the stage profile); parallel and SIMD now.
+- Short-wave width: the M5-tuned 6 tasks starved 16 cores (1x1 5.4 ms); it is
+  now 2/3 of the pool (12 on an M5 Max, 21 on the 9950X), and the i8mm path
+  uses it too (it spread 4..8-token waves over every thread).
+- Spin pool under load: with two cores busy on other work, spinning workers
+  and the waiting caller held the cores a preempted helper needed (M5: 32x4
+  57 ms, 32x16 108 ms). Spinners now `sched_yield` every 64 polls: 18.5 and
+  60.6 ms on the same loaded host.
+- Accuracy: `make test-gemma2` passes on x86 (text 0.999606) and on the M5.
+
+## 2026-10-10: Mixed-traffic scheduling (`--short-bypass-tokens`)
+
+Service rule (`inference_service.c`, with `pipeline_slots > 1`): requests of at
+most N tokens are short; waves are homogeneous (the head's class, or short-only
+when bypassing); an idle backend starts any wave; with waves in flight a new
+wave may start only if every in-flight wave is long and a short request is
+queued. Long waves therefore start only on an idle backend (slot 0), and CUDA
+runs bypass waves on slot clones created at the device's greatest stream
+priority. CUDA now has pipeline-slot clones (own stream, cuBLAS handle,
+workspace; shared weights) and a dedicated media context, like Metal.
+
+Mixed load (`perf/loadgen.c`): 10-token requests from 8 clients while 4
+clients send ~2.3k-token requests (440 numbered words; the old filler's token
+count also crept up as counters grew, so treat these as approximate — the
+fixed-filler rerun below is exact). Same binary per backend:
+
+| RTX 5090 | short req/s | short p50 | short p99 | long req/s |
+|---|---:|---:|---:|---:|
+| short alone (reference) | 4,283 | 1.85 ms | 1.95 ms | - |
+| default (1 slot) | 146 | 55.0 ms | 56.4 ms | 74.1 |
+| `--pipeline-slots 2` | 145 | 55.3 ms | 56.4 ms | 73.9 |
+| bypass 64 | 578 | 13.6 ms | 26.9 ms | 74.4 |
+| bypass 64 + high-priority bypass streams | 829 | 5.0 ms | 27.0 ms | 70.6 |
+
+| M5 Max (Metal, host loaded by user builds) | short req/s | short p50 | short p99 | long req/s |
+|---|---:|---:|---:|---:|
+| default | 43.4 | 175.5 ms | 227.9 ms | 22.1 |
+| bypass 64 (no queue priorities on Metal) | 143.1 | 56.3 ms | 97.4 ms | 19.9 |
+
+Correctness: a bypass server matches a plain one on 300 mixed-length texts at
+32-way concurrency (min cosine 0.999999137); `test_inference_service` passes;
+`make test-gemma2-cuda` passes with bypass off. Without a long background the
+rule changes nothing (short-alone rows equal).
+
+### 8k measurements and exact-token loadgen (2026-10-10)
+
+`perf/loadgen.c` now sends a unique `r<id> n<seq>` prefix plus a fixed `" the"`
+filler: exactly one token per filler word plus ~12, constant for the whole
+run (the old numbered words grew with the counters). 2036 words is a 2048-token
+request; 8170 words is ~8182 tokens, just under the 8,192 context.
+
+Engine, one 8,192-token sequence: CUDA (RTX 5090) 59.0 ms; Metal (M5 Max) 248.6
+ms; CPU x86 (Zen 5, AVX-512 VNNI) 6,649 ms; CPU ARM (M5 Max) 6,933 ms. At 8k the
+four global-attention layers dominate (CPU attention is fp32 and quadratic).
+
+HTTP on the 5090, default flags, 5 s per cell:
+
+| tokens | c1 req/s | c4 req/s | c16 req/s | c16 tok/s | c1 p50 |
+|---:|---:|---:|---:|---:|---:|
+| 2,048 | 79.7 | 87.2 | 89.2 | 183k | - |
+| ~8,182 | 16.0 | 17.4 | 18.9 | 155k | 62.7 ms |
+
+Mixed traffic on the 5090: 8 clients send 14-token requests while 4 clients
+send long ones.
+
+| long class | mode | short req/s | short p50 | short p99 | long req/s |
+|---|---|---:|---:|---:|---:|
+| 2,048 tokens | default | 171 | 47.9 ms | - | 84.3 |
+| 2,048 tokens | bypass 64 | 716 | 11.9 ms | 23.4 ms | 84.4 |
+| ~8,182 tokens | default | 45 | 179 ms | - | 17.1 |
+| ~8,182 tokens | bypass 64 | 175 | 59.5 ms | 115.8 ms | 17.1 |
+
+Against an 8k background a short request still waits for up to one in-flight
+59 ms long forward on the shared GPU (bypass waves overlap it on a
+high-priority stream but compete for SMs); long throughput is unchanged.
+
+### Context truncation and model-card audit (2026-10-10)
+
+Over-long input is now truncated instead of rejected. Text keeps the first
+8,191 tokens plus EOS (the reference tokenizer's truncation). Multimodal input
+shares the 8,192-token budget with a slot reserved for EOS: text is cut off,
+an image or frame is encoded at the largest vision budget that still fits
+(dropped below 70 tokens), and audio is trimmed to the remaining 25 tokens/s.
+Image/video parts take an optional `vision_tokens` (70..1120, card defaults
+280/140); the 300-second audio cap is gone (the context bounds it at ~327 s).
+
+Model card "do not use float16" check. Our GPU paths keep the residual stream,
+norms, softmax, and accumulators in fp32; fp16 appears only as GEMM/attention
+operands (CUDA: activations and weights; Metal: weights and K/V). An fp32
+reference probe recorded the largest operand magnitudes over code, numbers,
+CJK/Cyrillic/Arabic/emoji, punctuation runs, an 8k repeated-token sequence and
+2k random ids: residual 78, normed GEMM inputs 169, raw Q/K/V 559, GeGLU output
+71. Vision (noise, flat, gradients at 960x672) peaked at 732 and audio
+(extreme log-mel) at 138, against fp16's 65,504. BF16/F32 weights peak at 11;
+some vision position/patch weights are fp16-subnormal (absolute error < 6e-8).
+fp16 operands are safe for this model and carry 3 more mantissa bits than
+bf16; the card's warning concerns running the whole model (residual stream and
+accumulations) in fp16. Prefix formats, the symmetric 1,024-token sliding window
+(±512, llama.cpp `LLAMA_SWA_TYPE_SYMMETRIC`), media delimiters
+(`<|image>`/`<image|>` 255999/258882, `<|audio>`/`<audio|>` 256000/258883),
+Matryoshka re-normalization and the 768 default all match the card.
+
+### Executors: CPU workers, multiple GPUs, CPU overflow (2026-10-10)
+
+Request: spread load across many CPU cores and GPUs, with a user-chosen thread
+count. Each GPU pipeline slot and each CPU worker is now an executor (a slot of
+the inference service, tagged with its device); see CONTRIBUTING.md for the
+flags and scheduling rule. Prerequisites found on the way: the fast CPU graph
+kept one global workspace behind a global lock (now per-context, weight repack
+caches shared under a mutex), `EI_THREADS` was capped at 64 and the default
+pool at 32 threads, and `perf/loadgen.c` overflowed a 256-entry thread array
+above c256 (fixed; earlier results used c <= 256).
+
+One wave does not use a big machine. `bench_gemma2_cpu`, fast graph, 2x EPYC
+9754 (256 Zen 4c cores, 2 NUMA nodes, 32 L3 domains), tok/s:
+
+| pool threads | 14x32 | 32x16 | 128x8 | 512x4 |
+|---:|---:|---:|---:|---:|
+| 16 | 1,845 | 1,775 | 1,593 | 1,272 |
+| 32 | 3,348 | 3,467 | 3,108 | 2,499 |
+| 64 | 4,398 | 4,549 | 4,740 | 4,380 |
+| 128 | 1,658 | 1,878 | 1,955 | 2,603 |
+| 256 | 918 | 908 | 1,295 | 1,655 |
+
+HTTP on the same box (`perf/loadgen.c`, c256, 10 s, cache off, 256+ HTTP
+workers). "KxT" is K CPU workers of T threads, pinned along `ei_cpu_placement`:
+
+| layout | ~28-token req/s | p50 | ~242-token req/s | p50 |
+|---|---:|---:|---:|---:|
+| 1x64 (one pool) | 220 | 1,253 ms | 42.7 | 12.5 s |
+| 1x256 (one pool) | 119 | 2,707 ms | - | - |
+| 4x64 | 586 | 441 ms | - | - |
+| 8x32 | 764 | 366 ms | 101.8 | 3.26 s |
+| 16x16 | 826 | 270 ms | 112.9 | 2.81 s |
+| 8x16 (128 cores) | 455 | 606 ms | - | - |
+
+16x16 is 3.75x the best single pool on short requests (23k tok/s) and 2.6x on
+242-token requests (27k tok/s); half the cores give about half the throughput.
+Under full load each worker runs ~30% below its standalone speed (shared memory
+bandwidth). Pinning was worth +13% at 16x16 (390 -> 440 req/s before the HTTP
+fix). The 64-thread HTTP default had capped requests in flight (8x32 went 570
+-> 761 req/s at 256 workers); unless `--workers` is given the server now runs 32
+HTTP workers per executor. A per-worker wave cap (`--cpu-max-batch-tokens`,
+1024) changed nothing measurable but bounds a CPU wave's latency.
+
+GPU plus CPU overflow on the RTX 5090 box (Ryzen 9 9950X, 16 cores), 10 s:
+
+| load | GPU only | GPU + 2x8 CPU workers |
+|---|---|---|
+| 28 tokens c128 | 11,149 req/s, p99 11.8 ms | 11,142 req/s, p99 11.9 ms |
+| 28 tokens c1024 | 11,194 req/s, p99 102 ms | 10,844 req/s, p99 474 ms |
+| 242 tokens c128 | 1,454 req/s, p99 99 ms | 1,448 req/s, p99 481 ms |
+| 242 tokens c1024 | 1,546 req/s, p99 740 ms | 1,538 req/s, p99 1,106 ms |
+
+A first rule (overflow whenever every GPU slot is busy) cost 10-14% on short
+requests and pushed p99 to ~250 ms: CPU waves took requests the GPU's next
+11 ms wave would have served, and the CPU workers starved the HTTP threads.
+Overflow now waits for real backlog (queued work beyond `max_batch_tokens` per
+device) and takes from behind it. It still adds nothing on this box: 16 cores
+make a few thousand tok/s next to the GPU's ~350k. Even 256 EPYC cores (~27k
+tok/s) would add under 10% beside one 5090, so overflow stays opt-in.
+Parity: CPU overflow vs GPU-only min cosine 0.99981 (CUDA), 0.99966 (Metal);
+the int8-activation CPU path's known ceiling. Two engine copies on one GPU
+(`--cuda-devices 0,0 --pipeline-slots 2`) match a plain server at 0.9999995.
+Real multi-GPU scaling is unmeasured: no reachable multi-GPU CUDA box may be
+used (the 3090 box's GPU 0 is off limits; the MI300X box has no profile-2
+backend).
+
+Bug found by the 5090 sweep: the overflow check counted the request that
+crosses the backlog line as backlog while the take treated it as the devices'
+next wave. With exactly such a queue the backend picked an overflow wave, took
+nothing, and retried without waiting, holding the service mutex, so the GPU
+thread could never release its slot (server at 100% CPU, GPU idle). Both now
+use one `in_backlog` rule, an empty take waits on the condvar, and
+`test_inference_service` reproduces the boundary (it hangs the old code 3/3).
+
+## 2026-10-10: EmbeddingGemma 2 Metal media pass (text, image, audio, video; c1-c64)
+
+Host: M5 Max, macOS 26.6.2, **on battery (83-70%, discharging)** with a
+resident VM and user builds; engine A/Bs are back-to-back in one process
+(`make bench-gemma2-media`, median of 5 after 2 warmups), HTTP cells are the
+same script and binary before/after (`perf/loadgen.c`, `perf/loadgen_media.c`
+with `perf/media_fixtures.py` fixtures, 5 s per cell, response cache off).
+Flags land default-on (`FLASH64`, `VFUSED` where Metal 4; `AFUSED`;
+`--media-slots 2`; media finish batching); every route is `0`-able and the
+route test compares the defaults against every route off.
+
+Where the media time went (ablation with `EI_GEMMA2_METAL_SKIP`, 768x768
+image = 2,304 patches): GEMMs 18.5 ms at ~37 TFLOPS (the ceiling), attention
+40 ms on the simdgroup kernel (261 GFLOP at ~6.5 TFLOPS), 7 ms of norms,
+rotary and elementwise passes. 30 s audio: GEMMs 12 ms, 9.4 ms of elementwise
+passes (two clamps per GEMM, 46 dispatches per layer), attention 1.5 ms.
+
+Engine, ms per call (defaults before -> after; tokens are soft tokens):
+
+| item | before | after | speedup |
+|---|---:|---:|---:|
+| vision 432x432 (81) | 12.4 | 8.6 | 1.44x |
+| vision 768x768 (256) | 58.8 | 33.3 | 1.77x |
+| vision 960x960 (400) | 120.8 | 64.7 | 1.87x |
+| audio 10 s (250) | 14.7 | 9.4 | 1.56x |
+| audio 30 s (750) | 29.3 | 19.4 | 1.51x |
+
+Steps, each measured against the one before:
+
+- Vision attention on tensor ops: every `g2t_flash<64, ...>` crashes the
+  driver, so K/V are written as 128-wide zero-padded fp16 rows and a
+  `<D=128, DQ=64>` instantiation reads 64-wide Q and stores 64 columns. Exact
+  (pad columns add zeros). 768x768 58.8 -> 40.0 ms, 960x960 120.8 -> 73.8.
+- Fused vision layer (`g2_vqkv_post`: q/k/v norms + 2-D RoPE + padded fp16
+  K/V; quick-GELU up/gate epilogue on an interleaved weight; `g2_post_add_768`
+  sandwiches): 17 -> 10 dispatches per layer. 768x768 40.0 -> 33.3 ms, 432x432
+  10.7 -> 8.6. Remaining: GEMMs ~19 ms at the ceiling, attention ~14 ms (1.5x
+  the FLOPs of a 64-wide kernel), ~1 ms other.
+- fp16 copies for the F32 patch embedding (as [768][768]) and every 2-D `a.*`
+  projector weight: the audio pre-encode (1024x1536 Q8) and input projection
+  (F32) had been on the per-tile decode GEMM. Audio 10 s 14.7 -> 10.8 ms.
+- Audio clamps folded into producers and the GEMM epilogue, Gemma sandwiches
+  in `g2_post_add_1024`: 10 s 11.0 -> 9.4 ms, 30 s 23.4 -> 19.4.
+- Media slots (`--media-slots`, default 2; per-slot context and lock; text
+  waves no longer take the global lock either) and packing the media text
+  finishes into one wave on a dedicated context: image432 c8 63.6 -> 75.6
+  (slots) -> 103 req/s (finish batching); 4 slots was no better than 2.
+- CPU front ends: log-mel twiddle tables and sparse mel filters (bit-identical,
+  10 s audio HTTP c1 38.9 -> 24.2 ms), identity resize short-cut, video frames
+  decoded in parallel (video c1 62 -> 50 ms).
+
+Rejected:
+
+- 16 tokens per GEMV decode for 16-39-token waves: 16x1 4.3 -> 5.6 ms, 32x1
+  5.3 -> 7.1 (every case 1.3x slower). The short-wave GEMV is bound by its
+  per-token inner work, not by re-reading weights.
+- Register-resident flash attention via `get_left_input_cooperative_tensor` /
+  `reduce_rows`: the MPP header static-asserts a single-simdgroup scope for
+  cooperative-tensor inputs, so the 32x128 tile shared by 4 simdgroups cannot
+  be kept; per-simdgroup 8-row tiles would need 128+ accumulators per lane at
+  width 512. Not built.
+- 4 media slots: image432 c16 71 vs 77 req/s with 2; audio c8 69 vs 74.
+
+Observed, not changed: at 512 tokens x c16 the text service settles into a
+15-request wave (7,596 tokens, 101 ms) followed by a lone 1-request wave
+(10.8 ms) although all 16 fit in 8,192 tokens; merging them is worth ~5%.
+8,170-word requests spend ~50 ms of a 318 ms c1 round trip outside the GPU
+(tokenizing and JSON).
+
+Correctness: `make test-gemma2-metal-routes` (defaults vs all off: text
+1..8192 >= 0.99996 packed, vision >= 0.9999986, audio >= 0.999999),
+`make test-gemma2-metal` (goldens: text 0.999720428, vision 0.999815593,
+audio 0.999738422), `make test-metal test-http-metal` (300M, packed parity
+0.999964714 as before), `make test-gemma2` (CPU profile, shares media.c).
+CUDA builds of the media-slot code compile only on the CUDA boxes and were not
+run there (the finish batcher is Metal-only).
+
+HTTP (same script before/after, req/s; p50 in ms for c1):
+
+| cell | before | after | speedup | c1 p50 before -> after |
+|---|---:|---:|---:|---|
+| image768 c1 / c8 / c16 / c32 / c64 | 11.8 / 13.4 / 13.0 / 13.0 / 16.4 | 18.4 / 22.6 / 20.4 / 22.6 / 30.0 | 1.56x / 1.69x / 1.57x / 1.74x / 1.83x | 84.6 -> 53.1 ms |
+| image432 c1 / c8 / c16 / c32 / c64 | 42.2 / 50.6 / 51.6 / 50.6 / 61.8 | 55.0 / 85.0 / 73.2 / 76.6 / 87.2 | 1.30x / 1.68x / 1.42x / 1.51x / 1.41x | 23.6 -> 18.1 ms |
+| audio10s c1 / c8 / c16 / c32 / c64 | 25.6 / 48.6 / 49.6 / 53.6 / 62.4 | 43.6 / 79.8 / 68.8 / 77.2 / 84.0 | 1.70x / 1.64x / 1.39x / 1.44x / 1.35x | 38.9 -> 22.8 ms |
+| video4 c1 / c8 / c16 / c32 / c64 | 12.2 / 15.8 / 16.0 / 19.2 / 25.6 | 19.4 / 21.2 / 19.2 / 24.0 / 25.6 | 1.59x / 1.34x / 1.20x / 1.25x / 1.00x | 82.0 -> 51.5 ms |
+| text20 c1 / c8 / c16 / c32 / c64 | 278 / 884 / 1,649 / 2,272 / 2,433 | 275 / 877 / 1,538 / 1,927 / 2,180 | see note | 5.0 -> 5.0 ms |
+| text500 c1 / c8 / c16 / c32 / c64 | 104 / 131 / 122 / 125 / 138 | 104 / 128 / 108 / 112 / 125 | see note | 9.6 -> 9.6 ms |
+| text2036 c1 / c16; text8170 c1 / c8 | 24.2 / 51.2; 3.2 / 7.8 | 22.4 / 48.0; 3.4 / 8.2 | see note | 42.2 -> 44.9; 318 -> 300 ms |
+
+Before any media request was served at one GPU call at a time, so media
+throughput was flat from c1 to c64; it now rises with concurrency until the
+towers saturate the GPU (image768 c64 30 req/s = 7,680 soft tokens/s).
+
+Text note: the text path is unchanged by this pass (text waves merely stop
+taking the global lock). The matrix ran on a battery draining from 83% to 36%
+over 10 minutes and the text cells at c16+ read 0.85-0.93x; an interleaved
+A/B of the pre-change and new binaries right after (text500 c16: 124.8 vs
+131.2 then 134.4 vs 140.2 req/s; text20 c32: 2,287 vs 2,357 then 2,402 vs
+2,391) shows the new binary equal or ahead. The dip is host drift, as the
+10-09 entry warned.
+
+Open follow-ups: feed media finishes through the text service so they pack
+with text waves; the 15+1 wave split at 512 x c16.
+
+### Same day: video frames as one vision wave, CUDA build fix
+
+**Packed video wave** (`ei_gemma2_metal_vision_frames`, default on,
+`EI_GEMMA2_VIDEO_BATCH=0` off). Frames of one size are laid out frame after
+frame; `g2_patch`, `g2_position`, `g2_spatial_pool` and the fused
+`g2_vqkv_post` RoPE index `t % p.k` (p.k = tokens per frame), and attention
+and `g2_rope` take the per-token bounds buffer every route already honours
+(the tensor kernel's tile key range is `bounds[t0].x .. bounds[tl].y`, so a
+32-query tile straddling two frames scans two frames, no more). The HTTP
+video path encodes all prepared frames first (runs of same-sized frames up
+to 10,080 patch tokens per wave) and commits them in stream order with the
+same room checks as before; a frame without room is re-encoded at the room
+left, exactly as the sequential path did. Parity against one frame per wave,
+min cosine over frames (`scratchpad/vbatch_parity`):
+
+| route | 4 x 432x432 | notes |
+|---|---:|---|
+| default (FLASH64 tensor flash) | 0.999999448 | tiles straddle frames: online-softmax block order differs |
+| VFUSED=0 (`g2_rope` bounds) | 0.999999343 | |
+| FLASH64=0 (simdgroup flash bounds) | 0.999999425 | |
+| FLASH2=0 (`g2_attention`) | 1.000000000 | exact |
+| 3 x 768x480 (tiles never straddle) | 1.000000000 | exact |
+
+Engine, median of 5, `EI_BENCH_REPEAT=4` round-robin (ms per wave vs the
+single-frame tower times the frame count):
+
+| frames | one per wave | packed | gain |
+|---|---:|---:|---:|
+| 4 x 432x432 (81 tokens each) | 34.6 | 32.0 | 1.08x |
+| 8 x 432x432 | 69.2 | 62.2 | 1.11x |
+| 8 x 384x384 (64 tokens) | 59.2 | 47.5 | 1.25x |
+| 16 x 240x240 (25 tokens) | 74.4 | 52.1 | 1.43x |
+
+The tower is compute-bound already at 729 patches (two concurrent streams of
+v432 add only 15%), so the 140-token default frames gain ~10% and the gain
+grows as frames shrink. HTTP video4 (4 x 432 frames) interleaved A/B of the
+flag on the same binary, two passes: off 19.8/26.8/29.6 then 19.4/25.6/25.6
+req/s at c1/c8/c32, on 20.6/26.6/30.6 then 19.2/22.6/27.6: within the host's
+noise either way (c1 p50 50.0 -> 48.2 ms in pass 1). Kept on: it is exact,
+removes a command buffer round trip per frame, and the gain is real for
+small frames (`vision_tokens` near 70) and on any GPU the per-frame wave
+does not fill.
+
+**Host noise.** The first scaling runs read 8 frames at 151 and 106 ms
+against 62 ms minutes later, and `FLASH64=0` single frames at 12.9 ms with
+or without attention; the same binary read 62.2 +- 0.2 ms over four
+round-robin passes once the host settled. Long sequential item lists drift
+on this battery-powered shared host; `EI_BENCH_REPEAT` interleaves them.
+
+**CUDA build.** GCC on the 5090 rejected the media slot picker
+(`-Wstringop-overflow`: it cannot prove the slot index stays inside the
+array when `media_slot_count` is unbounded) and caught a real
+use-after-free in the new frame commit path (the canvas freed before the
+fallback tower call) that clang on the Mac did not. Both fixed;
+`make test-gemma2-cuda` on the RTX 5090 passes with the default two media
+slots (text 0.999724540, vision 0.999817210, audio 0.999735540, HTTP suite).
+
+## 2026-10-10 (evening): EmbeddingGemma 2 Metal, third pass (AC power)
+
+Host: M5 Max on AC at 100%, but shared with a user build at ~98% CPU, a
+browser renderer at ~55% and WindowServer at ~43% (GPU compositing), a VM and
+Docker. Identical configurations drifted 10-20% between back-to-back runs and
+once 2x inside one process (a packed 2048x4 wave read 294-340 ms, then 129 ms
+minutes later). Every number below is from an interleaved A/B or an in-process
+base/route pair; absolute values differ between tables for that reason.
+
+### Where the time goes (engine, default routes)
+
+Text forward, median ms, with `EI_GEMMA2_METAL_SKIP` ablations:
+
+| tokens | total | attention | GEMMs (`mm`) | `post` (48 post-add norms) |
+|---:|---:|---:|---:|---:|
+| 1 | 2.2 | 0.1 | 0.4 | 0.6 |
+| 20 | 4.4 | 0.55 | 1.05 | 0.7 |
+| 256 | 7.0 | 0.85 | 3.3 | 0.7 |
+| 2048 | 33.6 | 14 | 8 | - |
+| 4096 | 83.5 | 43 | 17 | - |
+| 8192 | 224 | 145 | 27 | - |
+
+- The one-token forward is a latency chain, not launch- or bandwidth-bound: a
+  chain of 240 dependent trivial dispatches costs 0.2-0.8 ms on this GPU
+  (`scratchpad/dispatch_floor.m`, 1-3 us each), yet the 48 single-row
+  post-add norms cost 12 us each and the small GEMVs 8 us each: a few
+  dependent memory round trips and barriers per kernel, times ~240 kernels.
+  Fusing kernels only helps if it removes round trips (the 10-09 post-norm
+  folding removed dispatches, not round trips, and gained nothing).
+- Long context is attention-bound: 65% at 8192 tokens. With 4 heads of width
+  512 on the 4 global layers and 4 heads of width 256 with a 512 window on
+  the other 20, the attention FLOPs at 8192 are ~2.9 TFLOP, so the flash
+  kernel ran at ~20 TFLOPS against the ~37 TFLOPS the GEMMs reach.
+- Media over HTTP at c1 (`EI_MEDIA_TIMING=1`): image432 = base64 0.8 + PNG
+  1.4 + tower 9.2 + finish 5.3 ms of 18.6; image768 = 2.7 + 4.7 + 33.3 + 7.5
+  of 55.5; audio10s = base64 1.1 + log-mel 2.05 + tower 9.8 + finish 7.4 of
+  23.6. The finish pass costs what a text request of the same length costs;
+  the finish batcher adds nothing at c1 (7.51 vs 7.57 ms with it off).
+
+### Landed
+
+**Flash tile on 8 simdgroups** (`g2t_flash_{256,512}_n8`, default; the former
+tile is `EI_GEMMA2_METAL_FLASH2_TILE=n4`). Same 32 x 128 tile, same
+arithmetic (cosine 1.000000000 against the 4-simdgroup tile; goldens
+unchanged), twice the threads per threadgroup so the 32 x 512 fp32 output
+accumulator is 64 floats per lane instead of 128. In-process base/route:
+
+| case | n4 -> n8 | q16 | q16k256 | n16 | q16n8 | q16k256n8 |
+|---|---:|---:|---:|---:|---:|---:|
+| 2048x1 | 1.10x | 1.08x | 1.07x | 1.05x | 1.08x | 1.17x |
+| 4096x1 | 1.04-1.12x | 1.13x | 1.15x | 1.00x | 1.05x | 1.19x |
+| 8192x1 | 1.21-1.27x | 1.08x | 1.16x | 1.16x | 1.11x | 1.25x |
+| 512x16 | 1.01-1.03x | 1.06x | 1.07x | 0.96x | 1.02x | 1.08x |
+| 1024x8 | 1.04x | 1.04x | 1.06x | 1.00x | 0.89x | 1.08x |
+| 16x1 / 64x1 / 256x1 / 128x8 | 1.05 / 1.04 / 1.04 / 1.02x | | | | | |
+
+`q16k256n8` (16 queries, 256-key blocks, 8 simdgroups) is as fast or faster
+on average but swung from 1.08x to 0.72x on 512x16 between runs and changes
+the block order (cosine 0.9999995); `n8` is exact and never below 1.0, so it
+is the default and the others stay selectable. `k64` is 0.90-0.99x. Old vs
+new binary over HTTP, two interleaved passes (req/s, c1 p50):
+
+| cell | old | new |
+|---|---|---|
+| text8170 c1 | 3.8 / 2.8 (292 / 364 ms) | 5.5 / 4.8 (189 / 216 ms) |
+| text8170 c8 | 9.0 / 7.5 | 12.8 / 11.2 |
+| text2036 c1 | 27.5 / 26.2 (36.8 / 38.4 ms) | 30.0 / 25.0 (33.4 / 40.0 ms) |
+| text2036 c16 | 59.2 / 54.8 | 64.5 / 51.8 |
+| text500 c16 | 140.0 / 119.2 | 137.8 / 130.2 |
+| text20 c1 | 245.8 / 241.2 | 254.5 / 246.5 |
+| text20 c16 | 1,806 / 1,764 | 2,059 / 1,806 |
+
+**Arrival-aware wave collection** (`EI_BATCH_ARRIVAL_WAIT_US`, default 5000,
+0 disables). A request only counted as active once tokenized, so at 512
+tokens x c16 the collector could not see the 15 requests still tokenizing
+after a wave and cut the next wave at its 800 us cap: the 16 clients
+phase-locked into a 15-request wave (101 ms) plus a lone one (10.8 ms). The
+service now counts requests from acceptance; while any are still tokenizing
+the collector keeps extending its deadline one `--batch-wait-us` at a time
+(at most 5 ms from the start of the collection) and solo inline execution
+yields. Wave log at text500 c16: before `15 1 15 16 1 15 14 16 1 ...`, after
+`16 16 16 ...` (every wave). Throughput: four interleaved passes read off
+81.5 / 91.5 / 108.0 / 112.2 vs on 85.2 / 105.8 / 105.2 / 113.8 req/s at c16
+while the c8 control moved the same +5%, so the throughput effect is inside
+the drift; the c16 p99 fell from 347 / 190 / 163 / 158 ms to 208 / 178 /
+166 / 171 (one wave instead of two). Kept for the tail and the verified
+mechanism.
+
+**Video frames in one wave** and the CUDA build fixes are in the entry above.
+
+### Rejected or deferred (measured)
+
+- Wide GEMM route below 40 tokens (`TENSOR2_MIN_TOKENS` 16/24/32): 0.84-0.97x
+  at 16-32 tokens, 1.04x at 39. 40 stays.
+- Packing sequences above the 1024-token cutoff: 2048x4 is 1.04x over four
+  single waves, 4096x2 1.02x, 1024x8 equal; attention dominates these waves,
+  so packing multiplies latency for nothing. Cutoff stays.
+- Keep-alive cap at c64 (`--keepalive-connections 63` vs the default 32 of
+  64 workers): text20 c64 2,565 / 2,514 -> 2,629 / 2,821 req/s, but c32 moved
+  the same way (2,562 / 2,661 -> 2,681 / 2,845) and it cannot be affected, so
+  it is drift. Not changed.
+- Shaving the one-token latency chain (2.2 ms + ~0.1 ms per token) needs
+  fewer dependent memory round trips per layer (register/threadgroup-resident
+  norm -> GEMV -> residual), not fewer dispatches; sized at ~15% of text c1
+  and ~5% of media c1. Not built this pass.
+
+Correctness: `make test-gemma2-metal-routes` (defaults vs all off, text
+>= 0.9999995, vision >= 0.9999986, audio >= 0.999999), `make test-gemma2-metal`
+(goldens unchanged: text 0.999720428, vision 0.999815593, audio 0.999738422),
+`make test-metal test-http-metal`, `make test-gemma2` (CPU), and
+`make test-gemma2-cuda` on the RTX 5090 (the scheduler change is shared).
+
+### Reference matrix and verification
+
+Full HTTP matrix on AC power at the start of the pass (req/s; c1 p50 in
+parentheses; `scratchpad/http_matrix.sh`, 5 s per cell, media fixtures from
+`perf/media_fixtures.py`), i.e. the state after the two earlier 10-10 passes
+and before this one:
+
+| cell | c1 | c8 | c16 | c32 | c64 |
+|---|---:|---:|---:|---:|---:|
+| text20 | 277.6 (4.99 ms) | 893.6 | 1668.6 | 2464.6 | 2313.4 |
+| text500 | 103.8 (9.61 ms) | 128.0 | 123.6 | 131.2 | 134.6 |
+| image768 | 18.2 (55.53 ms) | 24.0 | 22.4 | 26.8 | 32.4 |
+| image432 | 53.4 (18.63 ms) | 91.8 | 94.6 | 89.8 | 90.6 |
+| audio10s | 42.0 (23.63 ms) | 85.8 | 85.8 | 84.8 | 88.8 |
+| video4 | 19.0 (52.32 ms) | 23.4 | 22.8 | 27.2 | 32.6 |
+| text2036 c1 / c16 | 22.6 (44.09 ms) / 49.0 | | | | |
+| text8170 c1 / c8 | 3.4 (319.76 ms) / 8.0 | | | | |
+
+The same matrix re-run with the new defaults an hour later read 0.76-0.89x in
+every cell, including the untouched media towers, while a user build held a
+core at 98%; the towers in isolation still timed 8.74 / 9.43 ms (v432 / a10,
+unchanged). The same binary with every new behaviour switched off by env
+(`FLASH2_TILE=n4`, `EI_BATCH_ARRIVAL_WAIT_US=0`, `EI_GEMMA2_VIDEO_BATCH=0`)
+against its defaults, two interleaved passes, settles it:
+
+| cell | old behaviour | new defaults |
+|---|---|---|
+| text20 c32 | 2,458 / 2,755 | 2,764 / 2,804 |
+| text500 c64 | 148.2 / 152.2 | 156.2 / 152.0 |
+| image432 c8 | 90.0 / 91.2 | 92.5 / 95.0 |
+| audio10s c32 | 92.2 / 92.5 | 92.8 / 92.5 |
+| text8170 c1 | 4.0 / 3.0 (259 / 342 ms) | 5.2 / 5.0 (197 / 208 ms) |
+
+Media at c16-c64 is at the tower ceiling (image432 ~92 req/s = 8.7 ms per
+tower with two slots sharing the GPU); the text cells at c8-c64 are at the
+packed-wave ceiling measured on 10-09. The remaining single-request levers
+are the one-token latency chain (text c1, every media finish) and PNG decode
+(4.7 ms of image768's 55 ms).
+
+## 2026-10-11: EmbeddingGemma 2 Metal, fourth pass (front ends, attention, short-wave floor)
+
+Host: battery, a user build at 98-100% of a core throughout; in-process
+base/route pairs and interleaved runs only.
+
+### Landed
+
+**Table base64 decoder** (`src/media.c decode`). Every quad but the last goes
+through a 256-entry table with one validity check per quad; the last quad
+keeps the padding rules, so acceptance is unchanged (invalid bytes and '='
+inside the stream still reject). image768 base64 2.66 -> 0.15 ms, image432
+0.81 -> 0.05, audio10s 1.09 -> 0.07 (`EI_MEDIA_TIMING=1`, median of 5).
+
+**PNG inflate through libcompression** (macOS; `EI_PNG_INFLATE=0` restores
+stb's inflate). `src/vendor/stb_image.h` gained a one-line hook
+(`STBI_ZLIB_DECODE_HOOK`) at its IDAT inflate call; the hook checks the zlib
+header (deflate, no preset dictionary, FCHECK), inflates the raw stream with
+`compression_decode_buffer` into a buffer of the exact expected raw length
+plus 64 bytes of slack, and accepts the result only when the output length
+equals the expected length (interlaced files and anything odd fall back to
+stb). Inflate is exact, and the embeddings of all four fixtures are
+byte-identical with the hook on and off (`cmp` of the HTTP responses).
+image768 PNG decode 4.23 -> 2.51 ms, image432 1.33 -> 0.81; the remainder is
+stb's unfiltering and 3-channel conversion. Old vs new binary over HTTP,
+first (clean) interleaved pass, c1 p50: image768 51.7 -> 50.6 ms, image432
+17.8 -> 16.7, audio10s 22.2 -> 21.4, video4 47.1 -> 49.3 (second pass
+drifted 10-20% for both binaries alike). Linux builds are untouched
+(`__APPLE__` only; `-lcompression` added to the Darwin `LDLIBS`).
+
+### Rejected (measured)
+
+- **GQA K/V sharing in the flash kernel.** Sharing one K/V block across two
+  query heads has the same K/V bytes per FLOP as a 64-query tile, so the
+  64 x 64 tiles (`q64k64n8`, `q64k64n16`) stand in for it: 0.69-0.80x of the
+  n8 tile at 2k-8k tokens, 0.86-0.90x at 512x16. The kernel is not
+  K/V-bandwidth-bound; halving K/V traffic cannot help. fp16 Q staging (Q is
+  ~20% of the tile's bytes) is ruled out by the same measurement.
+- **16-query, 256-key, 8-simdgroup tile retest** against n8: +1-6% in one
+  pass, 0.90-1.07x in the next (64x1 .. 8192x1). Inside the drift; n8 stays.
+- **Short-wave fusions.** The ablations bound what removing one round trip
+  per layer can give: folding q/k norm + RoPE into the short attention
+  kernel (`SKIP=qknorm`) is at most 8% at 1 token and 2.5% at 20; split-K on
+  the three 512-row GEMVs (`SKIP=mm`) at most 9% / 2%. Both change
+  arithmetic order and fall under the 8-10% bar for that complexity. The
+  post-add kernel itself is minimal (one simdgroup, two reductions): its
+  12 us is the dependent round trip, not the kernel.
+
+### Deferred: persistent per-layer kernel
+
+The only way to cut the 11 dependent round trips per layer is a persistent
+cooperative kernel that keeps the residual row in threadgroup memory and
+synchronizes stages with device atomics. Metal guarantees neither
+co-residency nor forward progress across threadgroups, so viability has to
+be measured (barrier cost, co-resident threadgroup count) before any kernel
+is written. The probe written for that (now `perf/grid_barrier_probe.m`) had a
+spin cap large enough that the non-resident configurations ran for minutes,
+and when the host process was killed its command buffer kept the GPU at
+100% device utilization for a long time afterwards: orphaned GPU work
+survives its process on macOS. Lesson recorded in `AGENTS.md`; the probe
+needs a cap of ~10^5 spins and small group counts before it is run again.
+
+Run again with those caps once the GPU drained (24 barriers, 256-thread
+groups, device atomic counter, each group doing a little work per stage):
+
+| co-resident groups | us per barrier |
+|---:|---:|
+| 20 | 1.83 |
+| 40 | 1.92 |
+| 80 | 2.23 |
+| 160 | 3.88 |
+
+160 groups never hit the cap, so a persistent layer kernel on 80-160
+threadgroups is viable here: 11 stage barriers x ~2.5 us = ~28 us per layer
+against ~90 us of dependent dispatches today, i.e. the one-token forward
+could fall from 2.2 ms towards ~0.8 ms plus the weight-bandwidth floor
+(~0.3 ms). Design requirements before building it: a startup probe with a
+timeout that enables the route only when the chosen group count rendezvous
+on this device, a bounded spin in the production kernel that marks the wave
+failed instead of hanging (the host then re-runs it on the dispatch route),
+and group counts chosen from the probe, never from the dispatch size. The
+kernel itself is the GEMV / attention / norm sequence of
+`text_layer_fused` with the residual row in threadgroup memory and the
+512-row projections split across groups. Not started this pass.
+
+## 2026-10-11 (late): EmbeddingGemma 2 Metal, fifth pass (persistent layer, media cache, wave order)
+
+Three items from the brainstorm: the persistent per-layer kernel, caching
+beyond the HTTP response cache, and length-aware wave packing. Same host and
+discipline as the earlier passes (in-process base/route pairs, `EI_BENCH_BASE`
+= the shipped route, 9-iteration medians).
+
+### Persistent per-layer kernel: built, correct, not a win (opt-in)
+
+`g2_layer` (Metal 4 library, `src/metal4/kernels/gemma2_layer.metal`) runs the
+eleven short-wave stages of a text layer in one dispatch of G threadgroups of
+128 threads with a device-atomic grid barrier between stages. Stage bodies are
+the standalone kernels' bodies (`g2_qkv`, `g2_geglu`, `g2_gemv_core` with one
+row per simdgroup for the 512-row projections, `g2_qkv_post_body`,
+`g2_attention_body`, `g2_post_add_body`), so the result is bit-identical to the
+GEMV route with scalar attention (`test-gemma2-metal-routes` compares bytes at
+1..39 tokens and on a packed wave). Safety: a 264-barrier startup probe with a
+capped spin enables the route; in a forward a timed-out barrier sets a fail
+word, every group returns, and the host re-runs the forward on the dispatch
+route and turns the route off (verified by asking for 1024 groups: the probe
+fails, the forward runs at 1.00x on the dispatch route).
+
+Barrier cost by GPU timestamps (`perf/grid_barrier_probe.m`, 264 barriers,
+128-thread groups, best of 5):
+
+| groups | no fence | seq_cst device fence |
+|---:|---:|---:|
+| 64 | 2.25 us | 3.25 us |
+| 128 | 3.67 | 4.73 |
+| 256 | 4.69 | 1.91 |
+| 384 | 1.81 | 2.28 |
+| 512 | 2.43 | 3.00 |
+
+That is the cost of a dispatch boundary here (the 10-10 floor probe: 1-3 us),
+so replacing 11 dispatches by 10 barriers cannot win by itself. Forward times,
+base = shipped route (ms, median of 9):
+
+| case | base | G=64 | G=128 | G=256 | G=512 |
+|---|---:|---:|---:|---:|---:|
+| 1x1 | 2.24 | 2.45 | 2.26 | 2.27 | 2.60 |
+| 8x1 | 3.74 | 3.91 | 3.32 | 3.31 | 3.60 |
+| 20x1 | 4.28 | 6.82 | 5.47 | 5.20 | 6.92 |
+| 39x1 | 5.47 | 11.39 | 8.81 | 8.22 | 10.66 |
+
+Above 8 tokens each group runs its token groups serially where the dispatch
+route spreads them over more cores. The route ships opt-in
+(`EI_GEMMA2_METAL_LAYER=1`, `EI_GEMMA2_METAL_LAYER_GROUPS`). What would move
+the floor is fusing stages so round trips disappear (each group recomputing
+the post-norm for its tokens with ping-pong residual buffers; attention
+normalizing and rotating K/V on the fly), worth one barrier each; not built.
+
+### Media cache (landed, default 256 MiB)
+
+`--media-cache-mb N`: image and video-frame tower outputs keyed by (budget,
+128-bit payload hash), audio by (samples used, hash), and whole content
+objects by their JSON (`ei_response_cache`, one LRU across media slots). The
+HTTP response cache only served identical bodies; the same image with other
+text re-ran everything. c1 latencies over HTTP, same image with unique text,
+responses `cmp`-identical to the cache-off server:
+
+| request | cache off | cache on (hit) | exact repeat (whole-input hit) |
+|---|---:|---:|---:|
+| image768 | 46.9 ms | 13.0 ms | 2.8 ms |
+| audio10s | 21.0 | 10.4 | 1.5 |
+| video4 (4 frames) | 44.3 | 14.0 | 3.4 |
+
+The hit time is the finish pass (text over 256+ soft tokens) plus HTTP.
+Under load (`perf/loadgen_media.c`, same media with unique text per request,
+4 s cells, same binary with `--media-cache-mb 0` for the off column):
+
+| cell | cache off | cache on |
+|---|---:|---:|
+| image432 c1 | 62 req/s, p50 16.0 ms | 126 req/s, p50 7.8 ms |
+| image432 c8 | 82 req/s, p50 101 ms | 580 req/s, p50 17.0 ms |
+| image768 c1 | 17.8 req/s, p50 56 ms | 72 req/s, p50 13.3 ms |
+| image768 c8 | 21 req/s, p50 400 ms | 221 req/s, p50 36.7 ms |
+| audio10s c1 | 47 req/s, p50 20.9 ms | 92 req/s, p50 10.2 ms |
+| audio10s c8 | 74 req/s, p50 112 ms | 352 req/s, p50 30.1 ms |
+| video4 c1 | 17.2 req/s, p50 58 ms | 75 req/s, p50 12.9 ms |
+| video4 c4 | 19 req/s, p50 220 ms | 180 req/s, p50 21.8 ms |
+
+That is the repeat-media ceiling: the finish waves alone. Byte-identical.
+
+### Wave order (landed, `EI_BATCH_SORT=0` reverts)
+
+Sequences pack ragged, so a length-bucketed collector has no padding to save
+(the item as brainstormed was wrong). What ordering does change is where the
+packed attention tiles start. Mixed waves, both orders, in-process medians:
+
+| wave | short first | long first |
+|---|---:|---:|
+| 100x8 + 500x2 (x3) | 21.60 / 21.58 / 21.64 | 21.20 / 21.18 / 21.17 |
+| 50x16 + 800 (x2) | 20.14 / 20.12 | 19.73 / 19.92 |
+| 200x4 + 600x2 (x2) | 24.37 / 26.99 | 23.95 / 25.87 |
+| 2000 + 20x15 | 33.26 | 33.04 |
+| 1000x2 + 20x20 | 34.96 | 35.04 |
+
+Longest-first is 2-4% on the first three shapes and neutral on the others, so
+the backend sorts each wave longest first before packing (outputs stay in
+request order). An earlier 10% reading on the first pair was host noise; the
+alternating repeats are the evidence.
+
+### Rejected
+
+- Prefix K/V reuse across requests: attention is bidirectional (`t - w .. t +
+  w`), so no prefix of a sequence has a reusable K/V.
+- Length bucketing in the collector: nothing to save beyond the ordering above.
+
+## 2026-10-12: EmbeddingGemma 2 Metal, sixth pass (packed audio towers, hit-path JSON, flash softmax)
+
+Recommendation from the 10-12 brainstorm: cross-request tower packing (images,
+audio), a profile of the media hit and miss paths, and the flash kernel's
+long-context headroom. Same host and discipline (in-process pairs,
+`EI_BENCH_REPEAT`, interleaved HTTP rounds).
+
+### Cross-request packing: audio yes, images no
+
+Vision packing was sized with the existing bench before building anything
+(`bench_gemma2_media`, median of 5, three rounds):
+
+| case | single call | packed wave | per image |
+|---|---:|---:|---:|
+| 432x432 x8 | 8.58 ms | 62.1 ms | 7.8 ms (0.91x) |
+| 768x768 x4 | 33.4 ms | 129.0 ms | 32.3 ms (0.97x) |
+
+The tower is near its compute ceiling at 729 patches, so no image collector.
+Audio had room: a 30 s clip (750 tokens) took 19.2 ms where three 10 s clips
+took 27.7, and two streams reached 140 against 108 items/s for one.
+`ei_gemma2_metal_audio_clips` packs clips into one wave (convs per clip with
+offset binds, conformer over the packed rows with clip bounds in the depthwise
+conv and the relative-position attention). Routes test: packed clips against
+single encodes, cosine 0.999999 or exact at 96, 129, 600 and 1000 frames.
+
+| wave | ms/call | per 10 s clip | vs single |
+|---|---:|---:|---:|
+| a10 (1000 frames) | 9.37 | 9.37 | 1.00x |
+| a1000x2 | 13.84 | 6.92 | 1.35x |
+| a1000x4 | 25.36 | 6.34 | 1.48x |
+| a1000x8 | 50.76 | 6.35 | 1.48x |
+| a500x8 | 25.77 | (5 s clips) | 1.44x |
+
+Server: one audio thread with its own context packs every queued clip
+(`EI_MEDIA_AUDIO_BATCH=0` reverts). HTTP audio10s, media cache off, 4 s cells,
+two interleaved rounds (req/s, on / off):
+
+| c1 | c2 | c4 | c8 | c16 |
+|---:|---:|---:|---:|---:|
+| 40.0 / 43.0, 43.5 / 44.0 | 59.8 / 60.8, 60.8 / 61.5 | 70.8 / 68.0, 71.2 / 68.2 | 77.0 / 71.5, 78.5 / 71.2 | 79.8 / 74.5, 80.0 / 72.5 |
+
+A third run with stage timing read 93 against 67 req/s at c8. The gain is
+bounded by the finish wave: with timing on, a c8 request spends ~48 ms in the
+audio queue plus tower (6.3 ms of GPU per clip packed) and ~35 ms in the
+finish queue (8 x 255 rows = 2,040-row waves, ~4.4 ms of GPU per request),
+which puts the ceiling at ~93 req/s where the run landed.
+
+### Media hit and miss profile (`EI_MEDIA_TIMING=1`, c1, stage means)
+
+| request | base64 | decode | resize | tower | finish | loadgen p50 |
+|---|---:|---:|---:|---:|---:|---:|
+| image432 miss | 0.13 | 1.66 | 0.11 | 11.9 | 6.6 | 21.2 |
+| image768 miss | 0.40 | 4.81 | 0.20 | ~40 (one noisy run read 125) | 10.2 | 64 (noisy) |
+| image432 hit | cached 0.27 | | | | 5.9 | 7.5 |
+| image768 hit | cached 0.97 | | | | 8.3 | 13.3 |
+| video4 hit | | | | | 8.8 | 14.9 |
+
+The front end is under 10% of a miss, so hardware image decode was dropped.
+On hits, 4-6 ms per request were outside every stage and scaled with body
+size: `parse_input_item` and `media_part` each ran `parse_json_string` over
+the megabyte base64 string a byte at a time, and the response cache hashed the
+whole body with byte-wise FNV on every lookup. Fixes: plain-byte runs copy
+with `strcspn` + `memcpy`; the (in-memory only) cache hash mixes 8 bytes per
+step. Hit p50 over HTTP, new / old build, two interleaved rounds:
+
+| request | round 1 | round 2 |
+|---|---:|---:|
+| image768 c1 | 10.59 / 11.77 ms | 10.69 / 12.05 |
+| image432 c1 | 5.95 / 7.02 | 6.01 / 7.11 |
+| video4 c1 | 11.23 / 12.77 | 11.26 / 13.04 |
+| audio10s c1 | 9.24 / 9.82 | 9.27 / 9.95 |
+| image768 c8 | 26.8 / 27.3 | 28.6 / 29.1 |
+
+### Flash softmax variants (rejected)
+
+Attention is 60% of the 8192-token forward (250 vs 93-112 ms with
+`EI_GEMMA2_METAL_SKIP=attn`) and 32% at 2048. Two opt-in tile variants of
+the shipped 32x128 n8 kernel, in-process against base:
+
+| variant | 8192x1 | 2048x1 | 512x16 | min cosine |
+|---|---:|---:|---:|---:|
+| n8f: `fast::exp` in the softmax | 1.00x | 1.00x | 0.98x | 0.9999999 |
+| n8s: skip O rescale when no row max moved | 0.94x | 0.98x | 1.01x | 1.0 |
+| n8fs: both | 0.96x | 1.00x | 0.99x | 0.9999999 |
+
+The exponentials and the rescale are not the cost; the remaining gap is the
+matmul2d phases and the S/P threadgroup round trips, which a register-resident
+single-simdgroup tile would address (not built; see the 10-10 MPP note). The
+variants were removed. Host bug found on the way: the tile geometry parse used
+`hasSuffix:` for the simdgroup count, so a tile name with a trailing letter
+dispatched 4 simdgroups for an 8-simdgroup kernel (NaN output); it now uses
+`containsString:`.
+
+### Rejected
+
+- Cross-request image packing (under 10% at 432x432, 3.5% at 768x768).
+- Hardware image decode (PNG decode 1.7-4.8 ms of a 21-56 ms miss).
+- Flash softmax fast exp and rescale skip (above).

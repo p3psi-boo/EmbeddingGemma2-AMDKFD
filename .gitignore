@@ -1,0 +1,20 @@
+/build/
+/result
+/result-*
+/models/*
+!/models/.gitkeep
+__pycache__/
+*.pyc
+
+# Private diagnostics and local release/build artifacts.
+/results/
+/.local/
+/dist/
+/.env
+/.env.*
+*.gguf
+*.partial
+*.log
+*.core
+/core
+.DS_Store

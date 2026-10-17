@@ -1,0 +1,55 @@
+{
+  "date": "2026-10-17",
+  "architecture": "gfx1103",
+  "wave_size": 32,
+  "simd_count": 24,
+  "cpu": "AMD Eng Sample: 100-000000964-50_Y",
+  "system_ram_gib_approx": 30,
+  "vram_gib": 1,
+  "kernel": "6.18.28",
+  "firmware": {
+    "MES": "0x86",
+    "MES_KIQ": "0x109"
+  },
+  "model_revision": "031f0d4b35536f69ab3509d4893c923264fcf253",
+  "model_sha256": "6f1bd4ac6c5df7444f9cca7ca36cafe6cfa34cd6f49fefb1e0b4be8143aed8bc",
+  "env": {
+    "LIBKFD_CWSR_BACKEND": "gtt",
+    "EG2_KFD_TILE": "step8",
+    "EG2_KFD_FUSE": "1",
+    "EG2_KFD_CHUNK_LAYERS": "24",
+    "EG2_KFD_PROFILE": "0",
+    "EG2_KFD_DIAGNOSE": "0"
+  },
+  "server": {
+    "workers": 4,
+    "tokenizer_workers": 2,
+    "threads": 2,
+    "max_batch_tokens": 2048,
+    "max_batch_sequence_tokens": 2048,
+    "max_batch_requests": 32,
+    "batch_wait_us": 200,
+    "cache_entries": 0,
+    "response_cache_mb": 0,
+    "media_cache_mb": 0
+  },
+  "measurement": {
+    "queue_order": [
+      "pm4",
+      "aql"
+    ],
+    "reverse_order": false,
+    "requests_per_cell": 128,
+    "warmups_per_cell": 3,
+    "words": 30,
+    "encoding": "base64",
+    "transport": "localhost HTTP",
+    "sparse_ftrace": true
+  },
+  "limitations": [
+    "Short bounded runs, not a long-duration soak",
+    "No same-host CPU performance comparison in this dataset",
+    "Parity CPU timing comes from a different machine",
+    "Measurements predate publication cleanup; no GPU rerun during cleanup"
+  ]
+}
