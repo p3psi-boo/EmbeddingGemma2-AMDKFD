@@ -9,7 +9,8 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 python3 scripts/public_repo.py check
 ```
 
-CI cross-compiles both GPU code objects and runs only CPU checks. No model,
+Workflows are disabled. The local build cross-compiles both GPU code objects;
+run the CPU checks above manually. No model,
 GPU device, SSH credentials, or privileged runner is required. A successful
 build does not establish hardware support for a new target.
 

@@ -57,3 +57,8 @@ Upstream CPU graph and tokenizer numerical implementations are unchanged.
   checksum manifest; reject release overrides that do not match this lock.
 - Replace floating fetch/install examples with the pinned vendored equivalents.
   These optional upstream paths are not exercised by the KFD package build.
+
+## Workflow removal
+
+- Remove root and vendored GitHub Actions workflow files at maintainer request.
+  Build and dependency-lock checks remain available for local execution.

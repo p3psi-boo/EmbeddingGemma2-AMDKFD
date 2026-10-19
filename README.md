@@ -121,7 +121,7 @@ HTTP, tokenizer, mappings, and other process memory are additional.
 
 ## Validation
 
-CPU-only checks above run in CI. GPU checks are manual and should run one at a
+All workflows are disabled; run the CPU-only checks above locally. GPU checks are manual and should run one at a
 time, with the server stopped:
 
 ```bash

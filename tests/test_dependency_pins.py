@@ -26,25 +26,11 @@ class DependencyPinTests(unittest.TestCase):
             self.assertEqual(node['original']['rev'], node['locked']['rev'])
         self.assertIn(lock['nodes']['nixpkgs']['locked']['rev'], read('flake.nix'))
 
-    def test_actions_use_full_object_pins(self):
-        workflows = [ROOT / '.github/workflows/ci.yml',
-                     ROOT / 'vendor/embeddinggemma.c/.github/workflows/ci.yml']
-        for path in workflows:
-            source = path.read_text()
-            for action in re.findall(r'uses:\s*([^\s#]+)', source):
-                self.assertRegex(action, r'^[\w.-]+/[\w.-]+@[0-9a-f]{40}$')
-            self.assertNotIn('ubuntu-latest', source)
-        # The install action's former SHA was an annotated tag object, not a commit.
-        self.assertIn('install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702', workflows[0].read_text())
+    def test_no_workflows_are_shipped(self):
+        self.assertEqual(list((ROOT / '.github/workflows').glob('*.y*ml')), [])
+        self.assertEqual(list((ROOT / 'vendor/embeddinggemma.c/.github/workflows').glob('*.y*ml')), [])
 
-    def test_ci_uses_locked_tools_after_bootstrap(self):
-        source = read('.github/workflows/ci.yml')
-        self.assertIn('install_url: file://${{ runner.temp }}/nix-install', source)
-        self.assertIn('scripts/fetch-nix-installer.sh', source)
-        self.assertNotRegex(source, r'run:\s*python3\b')
-        self.assertNotIn('nix develop -c', source)
-        self.assertIn('nix build --no-update-lock-file', source)
-        self.assertIn('nix develop --no-update-lock-file -c bash', source)
+    def test_deployment_keeps_toolchain_locked(self):
         self.assertIn('pkgs.bash pkgs.coreutils', read('flake.nix'))
         self.assertIn('--no-update-lock-file', read('scripts/deploy-nix.sh'))
 
@@ -53,7 +39,7 @@ class DependencyPinTests(unittest.TestCase):
         version = re.search(r'^version=(\d+\.\d+\.\d+)$', source, re.M).group(1)
         self.assertRegex(source, r'(?m)^hash=[0-9a-f]{64}$')
         self.assertIn('sha256sum -c -', source)
-        self.assertIn(f"nix (Nix) {version}", read('.github/workflows/ci.yml'))
+        self.assertEqual(version, "2.35.3")
         self.assertNotIn('releases/latest', source)
 
     def test_model_download_has_revision_and_digest(self):

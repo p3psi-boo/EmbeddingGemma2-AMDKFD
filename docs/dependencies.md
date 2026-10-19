@@ -1,5 +1,8 @@
 # Dependency locks and reproducibility boundaries
 
+GitHub Actions and all repository workflows are disabled. Run builds and tests
+locally using the locked Nix commands below. Workflow files are not shipped.
+
 ## Supported KFD build
 
 The root Nix flake is the supported build path. `flake.lock` fixes nixpkgs to
@@ -8,26 +11,22 @@ The root Nix flake is the supported build path. `flake.lock` fixes nixpkgs to
 fixes the complete package definitions and transitive source hashes for Clang,
 LLVM/lld, CMake, Ninja, pkg-config, libdrm, Python, Git, curl, Gitleaks, Bash,
 coreutils, and the host compiler/runtime libraries. Package versions are not
-independently selected from system PATH in the CI test steps.
+independently selected from system PATH when checks run through `nix develop`.
 
 | Input | Lock |
 | --- | --- |
-| CI checkout action | `d23441a48e516b6c34aea4fa41551a30e30af803` (v6) |
-| CI Nix installation action | `448cde739abec1eaf0646249e3d25bb8d9bc7702` (v31.11.2 commit, not the annotated tag object) |
-| CI Nix bootstrap | 2.35.3; installer SHA-256 `69d0fe8fba8fe88f94c98b09964691ac9950abc7ecbf2ba861dc0533cfd901e9` |
+| Optional Nix installer | 2.35.3; installer SHA-256 `69d0fe8fba8fe88f94c98b09964691ac9950abc7ecbf2ba861dc0533cfd901e9` |
 | libkfd | Commit in `vendor/versions.json`; modified source included in this repository |
 | embeddinggemma.c | Commit in `vendor/versions.json`; modified source included in this repository |
 | Primary Q8_0 model | Revision and SHA-256 in `scripts/fetch-model.sh` |
 
-`scripts/fetch-nix-installer.sh` only downloads and verifies the installer. CI
-passes the verified local file to the pinned installation action and checks the
-installed Nix version. The verified upstream installer itself embeds and checks
-platform-specific Nix tarball hashes. It is not fetched from a latest-release URL.
-No Nix installation or upgrade is performed on a developer machine by this script.
+`scripts/fetch-nix-installer.sh` only downloads and verifies the optional Nix
+installer; it does not install or upgrade Nix. The verified upstream installer
+embeds platform-specific tarball hashes. No workflow executes it automatically.
 
-After bootstrap, CI runs Python, Bash syntax checks, Gitleaks, and builds in the
-locked Nix environment. CI and the deployment build use `--no-update-lock-file`,
-so a missing/stale input lock fails instead of being silently rewritten.
+Run Python, Bash syntax checks, Gitleaks and builds in the locked Nix environment.
+Use `--no-update-lock-file` to fail rather than silently rewriting missing/stale
+input locks; the deployment build already sets this option.
 
 ## Retained optional upstream paths
 
@@ -44,18 +43,12 @@ are not dependencies of the root KFD package:
 - Upstream binary installer: v0.3.1 plus a pinned checksum-manifest SHA-256.
   The manifest verifies each selected platform asset. Release overrides outside
   that lock fail; updating only a version string is insufficient.
-- Nested upstream workflow: checkout action pinned to a commit, with explicit
-  Ubuntu/macOS major image labels. GitHub does not run this nested workflow as
-  the root repository's CI.
-
 ## What is not fixed by a source lock
 
-GitHub-hosted runner labels (`ubuntu-24.04`, `macos-14`) do not select an immutable
-VM image. The runner agent, action execution runtime, bootstrap shell/curl,
-certificates, host kernel, amdgpu driver, APU firmware, hardware and concurrent
-workloads remain external. CI's Nix bootstrap must initially run on host tools;
-the subsequent build and test tools come from the pinned flake. The system Nix
-on a developer machine is not replaced automatically.
+The host kernel, amdgpu driver, APU firmware, hardware and concurrent workloads
+remain external. A manual Nix bootstrap initially uses host tools; subsequent
+build/test tools come from the pinned flake. The system Nix on a developer
+machine is not replaced automatically. GitHub Actions is disabled.
 
 The retained upstream multi-platform release notes describe historical,
 non-Nix recipes (including apt-based container builds). Those are not the
@@ -67,9 +60,9 @@ model lock.
 ## Deliberate updates
 
 1. Change the intended revision/version and its content hash together. Resolve
-   annotated tags to commits before using them as source/action pins.
+   annotated tags to commits before using them as source pins.
 2. For nixpkgs, change the explicit input revision and deliberately regenerate
-   `flake.lock`; review the lock diff. Do not update the toolchain during CI.
+   `flake.lock`; review the lock diff. Keep toolchain updates deliberate.
 3. Run the offline pin checks and all CPU regressions in the locked environment:
 
    ```bash
@@ -80,7 +73,7 @@ model lock.
 4. For compiler/model/driver changes, rerun relevant manual hardware and parity
    tests before carrying forward performance or stability claims.
 
-The pinning tests cover action references, Nix locks/bootstrap, model download,
+The pinning tests enforce workflow absence and cover Nix locks/bootstrap, model download,
 optional Catch2/XPU sources, and the retained upstream installer. Download-gate
 unit tests reject checksum mismatches and existing/symlink destinations without
 using the network or executing installers.
